@@ -1,9 +1,9 @@
-"""Train a single binding-affinity regressor.
+"""Train a single 50 nM binder / non-binder classifier.
 
 Builds (or reuses) the cached feature matrix, applies an 80/20 cold-protein
 split, trains the requested model (random forest by default, or an MLP), prints
-MAE/RMSE/R^2 on the held-out test set, and saves the model as a joblib file. The
-core routines are imported by ``grid_search.py``.
+classification metrics on the held-out test set, and saves the model as a
+joblib file. The core routines are imported by ``grid_search.py``.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from typing import Any, Optional
 import numpy as np
 
 import config
+from src.data_prep import binarize_pactivity
 from src.featurize import FeatureDataset, build_features, subset_to_memmap
 from src.metrics import print_metrics
 from src.models import BaseRegressor, build_model
@@ -69,6 +70,9 @@ def fit_on_indices(
 ) -> BaseRegressor:
     """Materialize the training rows and fit a model on them.
 
+    Continuous pActivity labels are binarized at
+    ``config.ACTIVITY_THRESHOLD_NM`` before fitting.
+
     Args:
         dataset: The feature dataset.
         train_idx: Row indices to train on.
@@ -85,7 +89,7 @@ def fit_on_indices(
     """
     tmp_path = os.path.join(dataset.directory, f"split_{tag}.dat")
     X_train = subset_to_memmap(dataset, train_idx, tmp_path)
-    y_train = dataset.load_y()[train_idx]
+    y_train = binarize_pactivity(dataset.load_y()[train_idx])
     build_kwargs = dict(hyperparams)
     if model_type == "mlp":
         build_kwargs["protein_dim"] = dataset.protein_dim
@@ -99,10 +103,20 @@ def fit_on_indices(
         "n_features": dataset.n_features,
         "model_type": model_type,
         "hyperparams": hyperparams,
+        "activity_threshold_nm": config.ACTIVITY_THRESHOLD_NM,
+        "task": "classification",
     }
     if verbose:
-        print(f"[train] fitting {model_type} on {len(train_idx)} rows")
-    model.fit(X_train, y_train, verbose=verbose)
+        pos_frac = float(np.mean(y_train))
+        print(
+            f"[train] fitting {model_type} on {len(train_idx)} rows "
+            f"(active_frac={pos_frac:.3f} @ {config.ACTIVITY_THRESHOLD_NM:g} nM)"
+        )
+    fit_kwargs: dict[str, Any] = {"verbose": verbose}
+    if model_type == "mlp":
+        # Align protein ids with the materialized train memmap for cold-protein ES.
+        fit_kwargs["groups"] = dataset.load_groups()[train_idx]
+    model.fit(X_train, y_train, **fit_kwargs)
     del X_train
     return model
 
@@ -126,11 +140,12 @@ def evaluate_on_indices(
         tag: Filename tag for the temporary split memmap.
 
     Returns:
-        The metric mapping (``mae``, ``rmse``, ``r2``).
+        The metric mapping (``accuracy``, ``precision``, ``recall``, ``f1``,
+        ``auroc``, ``auprc``).
     """
     tmp_path = os.path.join(dataset.directory, f"split_{tag}.dat")
     X_eval = subset_to_memmap(dataset, idx, tmp_path)
-    y_eval = dataset.load_y()[idx]
+    y_eval = binarize_pactivity(dataset.load_y()[idx])
     preds = model.predict(X_eval)
     del X_eval
     from src.metrics import compute_metrics
@@ -191,7 +206,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     Returns:
         The configured :class:`argparse.ArgumentParser`.
     """
-    p = argparse.ArgumentParser(description="Train a binding-affinity regressor.")
+    p = argparse.ArgumentParser(description="Train a 50 nM binder / non-binder classifier.")
     p.add_argument("--model", choices=["rf", "mlp"], default=config.DEFAULT_MODEL_TYPE)
     p.add_argument("--csv", default=config.TRAIN_CSV, help="Training CSV path.")
     p.add_argument("--limit", type=int, default=None, help="Cap on raw rows (smoke tests).")
@@ -229,7 +244,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--es-val-fraction",
         type=float,
         default=float(config.MLP_DEFAULTS["es_val_fraction"]),
-        help="Fraction of training rows held out for MLP early stopping.",
+        help="Target fraction of training rows for the cold-protein MLP ES holdout.",
     )
     p.add_argument(
         "--batchnorm",

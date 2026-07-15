@@ -39,11 +39,12 @@ def cold_protein_split(
         Every protein's rows land entirely within a single split.
     """
     rng = np.random.default_rng(seed)
-    unique_groups = np.unique(groups)
+    unique_groups, group_counts = np.unique(groups, return_counts=True)
+    count_by_group = {int(g): int(c) for g, c in zip(unique_groups, group_counts)}
+    unique_groups = unique_groups.copy()
     rng.shuffle(unique_groups)
 
     n_rows = groups.shape[0]
-    counts = {g: int(np.count_nonzero(groups == g)) for g in unique_groups}
 
     names = list(fractions)
     targets = {name: fractions[name] * n_rows for name in names}
@@ -62,8 +63,9 @@ def cold_protein_split(
             if deficit > best_deficit and deficit > 0:
                 best_deficit = deficit
                 best_name = name
-        group_to_split[int(g)] = best_name
-        assigned_rows[best_name] += counts[g]
+        gid = int(g)
+        group_to_split[gid] = best_name
+        assigned_rows[best_name] += count_by_group[gid]
 
     indices: dict[str, list[int]] = {name: [] for name in names}
     for row_idx, g in enumerate(groups):

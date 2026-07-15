@@ -1,10 +1,10 @@
-"""Predict binding affinity for new proteins and ligands.
+"""Predict binder probability for new proteins and ligands.
 
 Four input modes are supported:
 
 1. ``--spreadsheet``: one spreadsheet carrying both ligand SMILES and protein
-   sequence columns; a ``pActivity (Predicted)`` column is appended and written
-   to ``*_predictions.<ext>`` (extension preserved).
+   sequence columns; a ``P(Active)`` column is appended and written to
+   ``*_predictions.<ext>`` (extension preserved).
 2. ``--ligand`` + ``--protein``: a single ligand input crossed with a single
    protein input (each may itself contain many entries); every ligand-protein
    pair is written to one CSV.
@@ -14,7 +14,8 @@ Four input modes are supported:
 
 Unless overridden, each query is assumed to be a Ki measurement at pH 7.4 and
 25 C. Embeddings for any new protein or ligand are computed and written back to
-the LMDB caches during prediction.
+the LMDB caches during prediction. ``P(Active)`` is the predicted probability
+that activity is at most the model's training threshold (default 50 nM).
 """
 
 from __future__ import annotations
@@ -55,7 +56,7 @@ _PAIR_HEADER: list[str] = [
     "Assay",
     "pH",
     "Temp (C)",
-    "pActivity (Predicted)",
+    "P(Active)",
 ]
 _ASSAY_INDEX = {name: i for i, name in enumerate(config.ASSAY_TYPES)}
 _CHUNK = 20_000
@@ -279,7 +280,7 @@ def predict_spreadsheet(predictor: Predictor, path: str, assay: str, ph: float, 
         [float(p) for p in phs],
         [float(t) for t in temps],
     )
-    df["pActivity (Predicted)"] = preds
+    df["P(Active)"] = preds
     out_path = predictions_output_path(path)
     write_table(df, out_path)
     return out_path

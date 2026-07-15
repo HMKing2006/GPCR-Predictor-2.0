@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Iterable, Iterator, Optional
 
+import numpy as np
 from rdkit import Chem, RDLogger
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
@@ -172,6 +173,26 @@ def activity_to_pactivity(activity_nm: float) -> float:
         ``-log10(activity_nm * 1e-9)`` (i.e. pActivity on the molar scale).
     """
     return -math.log10(activity_nm * 1e-9)
+
+
+def binarize_pactivity(
+    y: np.ndarray,
+    threshold_nm: float = config.ACTIVITY_THRESHOLD_NM,
+) -> np.ndarray:
+    """Convert continuous pActivity labels to binder / non-binder classes.
+
+    A row is labeled active (``1``) when its activity is at most
+    ``threshold_nm`` nM, i.e. when ``pActivity >= -log10(threshold_nm * 1e-9)``.
+
+    Args:
+        y: Continuous pActivity values.
+        threshold_nm: Activity cutoff in nM (default ``config.ACTIVITY_THRESHOLD_NM``).
+
+    Returns:
+        A ``float32`` array of ``0.0`` / ``1.0`` labels with the same shape as ``y``.
+    """
+    thr = activity_to_pactivity(threshold_nm)
+    return (np.asarray(y) >= thr).astype(np.float32)
 
 
 def iter_prepared_rows(

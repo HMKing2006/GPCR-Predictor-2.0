@@ -1,9 +1,8 @@
 """Search model types and hyperparameters with an 80/10/10 cold-protein split.
 
-This is a thin driver over the training routines in ``train.py``. Each candidate
-is trained on the train split and scored on the validation split, with metrics
-printed as soon as the candidate finishes. The candidate with the lowest
-validation RMSE is finally evaluated on the held-out test split and saved.
+Each candidate is trained on the train split and scored on the validation split,
+with metrics printed as soon as the candidate finishes. The candidate with the
+highest validation AUROC is finally evaluated on the held-out test split and saved.
 """
 
 from __future__ import annotations
@@ -18,17 +17,16 @@ from src.models import BaseRegressor
 from src.splits import train_val_test_split
 from train import evaluate_on_indices, fit_on_indices
 
-# Bilinear-only grid (non-bilinear candidates commented out temporarily).
 # Every entry inherits MLP defaults including early stopping; ``epochs`` is a
 # ceiling, not the actual run length.
 NN_GRID: list[dict[str, Any]] = [
-    # {"hidden_dim": 512, "num_layers": 2, "learning_rate": 1e-3},
-    # {"hidden_dim": 1024, "num_layers": 3, "learning_rate": 5e-4},
-    # {"hidden_dim": 1024, "num_layers": 3, "learning_rate": 5e-4, "dropout": 0.2},
-    # {"hidden_dim": 1536, "num_layers": 4, "learning_rate": 3e-4, "dropout": 0.2, "weight_decay": 0.0},
-    # {"hidden_dim": 1024, "num_layers": 3, "learning_rate": 5e-4, "use_batchnorm": True},
-    {"hidden_dim": 1024, "num_layers": 3, "learning_rate": 5e-4, "use_bilinear": True, "bilinear_dim": 256},
-    {"hidden_dim": 1024, "num_layers": 3, "learning_rate": 3e-4, "dropout": 0.2, "use_bilinear": True, "bilinear_dim": 512},
+    {"hidden_dim": 512, "num_layers": 2, "learning_rate": 1e-3},
+    {"hidden_dim": 1024, "num_layers": 3, "learning_rate": 5e-4},
+    {"hidden_dim": 1024, "num_layers": 3, "learning_rate": 5e-4, "dropout": 0.2},
+    {"hidden_dim": 1536, "num_layers": 4, "learning_rate": 3e-4, "dropout": 0.2, "weight_decay": 0.0},
+    {"hidden_dim": 1024, "num_layers": 3, "learning_rate": 5e-4, "use_batchnorm": True},
+    # {"hidden_dim": 1024, "num_layers": 3, "learning_rate": 5e-4, "use_bilinear": True, "bilinear_dim": 256},
+    # {"hidden_dim": 1024, "num_layers": 3, "learning_rate": 3e-4, "dropout": 0.2, "use_bilinear": True, "bilinear_dim": 512},
 ]
 
 # Optional random-forest baselines, enabled with ``--include-rf``.
@@ -93,7 +91,7 @@ def _merge_defaults(model_type: str, overrides: dict[str, Any]) -> dict[str, Any
 
 
 def run_grid_search(args: argparse.Namespace) -> str:
-    """Run the grid search and save the best model by validation RMSE.
+    """Run the grid search and save the best model by validation AUROC.
 
     Args:
         args: Parsed CLI arguments.
@@ -115,7 +113,7 @@ def run_grid_search(args: argparse.Namespace) -> str:
 
     grid = build_grid(args.include_rf)
     best_model: Optional[BaseRegressor] = None
-    best_rmse = float("inf")
+    best_auroc = float("-inf")
     best_desc = ""
 
     for index, (model_type, overrides) in enumerate(grid):
@@ -136,13 +134,13 @@ def run_grid_search(args: argparse.Namespace) -> str:
         scores = evaluate_on_indices(
             model, dataset, split["val"], label=f"[grid] {desc} val", verbose=True, tag="grid_val"
         )
-        if scores["rmse"] < best_rmse:
-            best_rmse = scores["rmse"]
+        if scores["auroc"] > best_auroc:
+            best_auroc = scores["auroc"]
             best_model = model
             best_desc = desc
 
     assert best_model is not None, "Grid search produced no model."
-    print(f"\n[grid] best (val RMSE={best_rmse:.4f}): {best_desc}")
+    print(f"\n[grid] best (val AUROC={best_auroc:.4f}): {best_desc}")
     print("[grid] best model test-set performance:")
     evaluate_on_indices(
         best_model, dataset, split["test"], label="test", verbose=True, tag="grid_test"
@@ -161,7 +159,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     Returns:
         The configured :class:`argparse.ArgumentParser`.
     """
-    p = argparse.ArgumentParser(description="Grid-search model types and hyperparameters.")
+    p = argparse.ArgumentParser(description="Grid-search binder classifiers and hyperparameters.")
     p.add_argument("--csv", default=config.TRAIN_CSV)
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--protein-model", default=config.DEFAULT_PROTEIN_MODEL)

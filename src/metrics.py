@@ -1,147 +1,152 @@
-"""Regression metrics for binding-affinity evaluation."""
+"""Classification metrics for 50 nM binder / non-binder evaluation."""
 
 from __future__ import annotations
 
 import numpy as np
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 
 
-def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Compute the mean absolute error.
+def _binary_labels(y_prob: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+    """Threshold predicted probabilities into hard class labels.
 
     Args:
-        y_true: Ground-truth pActivity values.
-        y_pred: Predicted pActivity values.
+        y_prob: Predicted positive-class probabilities.
+        threshold: Decision threshold applied to ``y_prob``.
 
     Returns:
-        The mean absolute error.
+        Integer array of predicted labels in ``{0, 1}``.
     """
-    return float(np.mean(np.abs(y_true - y_pred)))
+    return (np.asarray(y_prob) >= threshold).astype(np.int32)
 
 
-def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Compute the root-mean-squared error.
+def accuracy(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """Compute accuracy at a 0.5 probability threshold.
 
     Args:
-        y_true: Ground-truth pActivity values.
-        y_pred: Predicted pActivity values.
+        y_true: Ground-truth binary labels.
+        y_prob: Predicted positive-class probabilities.
 
     Returns:
-        The root-mean-squared error.
+        Classification accuracy.
     """
-    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    return float(accuracy_score(y_true, _binary_labels(y_prob)))
 
 
-def r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Compute the coefficient of determination (R^2).
+def precision(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """Compute precision of the positive (binder) class.
 
     Args:
-        y_true: Ground-truth pActivity values.
-        y_pred: Predicted pActivity values.
+        y_true: Ground-truth binary labels.
+        y_prob: Predicted positive-class probabilities.
 
     Returns:
-        The R^2 score. Returns ``0.0`` when the target has zero variance.
+        Precision, or ``0.0`` when there are no predicted positives.
     """
-    ss_res = float(np.sum((y_true - y_pred) ** 2))
-    ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
-    if ss_tot == 0.0:
-        return 0.0
-    return 1.0 - ss_res / ss_tot
+    return float(precision_score(y_true, _binary_labels(y_prob), zero_division=0))
 
 
-def pearson(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Compute the Pearson linear correlation coefficient.
+def recall(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """Compute recall of the positive (binder) class.
 
     Args:
-        y_true: Ground-truth pActivity values.
-        y_pred: Predicted pActivity values.
+        y_true: Ground-truth binary labels.
+        y_prob: Predicted positive-class probabilities.
 
     Returns:
-        Pearson ``r`` in ``[-1, 1]``. Returns ``0.0`` when fewer than two
-        samples are present or either input has zero variance.
+        Recall, or ``0.0`` when there are no true positives.
     """
-    if y_true.shape[0] < 2:
-        return 0.0
-    if np.std(y_true) == 0.0 or np.std(y_pred) == 0.0:
-        return 0.0
-    r = np.corrcoef(y_true, y_pred)[0, 1]
-    return float(r) if np.isfinite(r) else 0.0
+    return float(recall_score(y_true, _binary_labels(y_prob), zero_division=0))
 
 
-def _rank(values: np.ndarray) -> np.ndarray:
-    """Rank values, assigning tied entries their average rank.
+def f1(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """Compute the F1 score of the positive (binder) class.
 
     Args:
-        values: A one-dimensional array of values to rank.
+        y_true: Ground-truth binary labels.
+        y_prob: Predicted positive-class probabilities.
 
     Returns:
-        A ``float64`` array of ranks (average-tie convention).
+        F1 score, or ``0.0`` when undefined.
     """
-    order = np.argsort(values, kind="mergesort")
-    ranks = np.empty(values.shape[0], dtype=np.float64)
-    ranks[order] = np.arange(1, values.shape[0] + 1, dtype=np.float64)
-    sorted_vals = values[order]
-    # Average the ranks of equal-valued runs so ties do not bias the correlation.
-    start = 0
-    for i in range(1, sorted_vals.shape[0] + 1):
-        if i == sorted_vals.shape[0] or sorted_vals[i] != sorted_vals[start]:
-            if i - start > 1:
-                ranks[order[start:i]] = ranks[order[start:i]].mean()
-            start = i
-    return ranks
+    return float(f1_score(y_true, _binary_labels(y_prob), zero_division=0))
 
 
-def spearman(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Compute the Spearman rank correlation coefficient.
+def auroc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """Compute the area under the ROC curve.
 
     Args:
-        y_true: Ground-truth pActivity values.
-        y_pred: Predicted pActivity values.
+        y_true: Ground-truth binary labels.
+        y_prob: Predicted positive-class probabilities.
 
     Returns:
-        Spearman ``rho`` in ``[-1, 1]``. Returns ``0.0`` when fewer than two
-        samples are present or either ranking has zero variance.
+        AUROC in ``[0, 1]``. Returns ``0.5`` when only one class is present.
     """
-    if y_true.shape[0] < 2:
-        return 0.0
-    return pearson(_rank(y_true), _rank(y_pred))
+    if len(np.unique(y_true)) < 2:
+        return 0.5
+    return float(roc_auc_score(y_true, y_prob))
 
 
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-    """Compute MAE, RMSE, R^2 and rank/linear correlations together.
+def auprc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """Compute the area under the precision-recall curve.
 
     Args:
-        y_true: Ground-truth pActivity values.
-        y_pred: Predicted pActivity values.
+        y_true: Ground-truth binary labels.
+        y_prob: Predicted positive-class probabilities.
 
     Returns:
-        A mapping with keys ``"mae"``, ``"rmse"``, ``"r2"``, ``"pearson"`` and
-        ``"spearman"``.
+        Average precision. Returns the positive-class prevalence when only one
+        class is present.
+    """
+    if len(np.unique(y_true)) < 2:
+        return float(np.mean(y_true))
+    return float(average_precision_score(y_true, y_prob))
+
+
+def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> dict[str, float]:
+    """Compute accuracy, precision, recall, F1, AUROC and AUPRC together.
+
+    Args:
+        y_true: Ground-truth binary labels.
+        y_prob: Predicted positive-class probabilities.
+
+    Returns:
+        A mapping with keys ``"accuracy"``, ``"precision"``, ``"recall"``,
+        ``"f1"``, ``"auroc"`` and ``"auprc"``.
     """
     return {
-        "mae": mae(y_true, y_pred),
-        "rmse": rmse(y_true, y_pred),
-        "r2": r2(y_true, y_pred),
-        "pearson": pearson(y_true, y_pred),
-        "spearman": spearman(y_true, y_pred),
+        "accuracy": accuracy(y_true, y_prob),
+        "precision": precision(y_true, y_prob),
+        "recall": recall(y_true, y_prob),
+        "f1": f1(y_true, y_prob),
+        "auroc": auroc(y_true, y_prob),
+        "auprc": auprc(y_true, y_prob),
     }
 
 
-def print_metrics(y_true: np.ndarray, y_pred: np.ndarray, label: str = "") -> dict[str, float]:
+def print_metrics(y_true: np.ndarray, y_prob: np.ndarray, label: str = "") -> dict[str, float]:
     """Compute metrics and print them in a compact one-line summary.
 
     Args:
-        y_true: Ground-truth pActivity values.
-        y_pred: Predicted pActivity values.
+        y_true: Ground-truth binary labels.
+        y_prob: Predicted positive-class probabilities.
         label: Optional prefix identifying the evaluation (e.g. ``"test"``).
 
     Returns:
         The computed metric mapping (see :func:`compute_metrics`).
     """
-    scores = compute_metrics(y_true, y_pred)
+    scores = compute_metrics(y_true, y_prob)
     prefix = f"{label} " if label else ""
     print(
-        f"{prefix}MAE={scores['mae']:.4f}  RMSE={scores['rmse']:.4f}  R2={scores['r2']:.4f}  "
-        f"Pearson={scores['pearson']:.4f}  Spearman={scores['spearman']:.4f}",
+        f"{prefix}Acc={scores['accuracy']:.4f}  Prec={scores['precision']:.4f}  "
+        f"Rec={scores['recall']:.4f}  F1={scores['f1']:.4f}  "
+        f"AUROC={scores['auroc']:.4f}  AUPRC={scores['auprc']:.4f}",
         flush=True,
     )
     return scores

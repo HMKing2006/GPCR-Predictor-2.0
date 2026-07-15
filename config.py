@@ -1,4 +1,4 @@
-"""Central configuration for the GPCR binding-affinity predictor.
+"""Central configuration for the GPCR binder classifier.
 
 This module holds default model identifiers, filesystem paths, feature layout
 constants, and default hyperparameters shared across the training, grid-search
@@ -16,6 +16,8 @@ from typing import Any, Final
 PROJECT_ROOT: Final[str] = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR: Final[str] = os.path.join(PROJECT_ROOT, "data")
 TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "BindingDB_all_prepared.csv")
+PAPYRUS_PP_TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "Papyrus_pp_prepared.csv")
+PAPYRUS_FULL_TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "Papyrus_full_prepared.csv")
 CACHE_DIR: Final[str] = os.path.join(PROJECT_ROOT, "cache")
 SPLITS_DIR: Final[str] = os.path.join(DATA_DIR, "splits")
 MODELS_DIR: Final[str] = os.path.join(PROJECT_ROOT, "models")
@@ -70,6 +72,12 @@ def feature_dim(protein_dim: int = PROTEIN_EMB_DIM, ligand_dim: int = LIGAND_EMB
     return protein_dim + ligand_dim + len(ASSAY_TYPES) + NUM_SCALAR_FEATURES
 
 
+# --- Classification label ----------------------------------------------------
+
+# Binders are positives: activity_nM <= this threshold (equivalently
+# pActivity >= -log10(threshold_nM * 1e-9)).
+ACTIVITY_THRESHOLD_NM: Final[float] = 50.0
+
 # --- Default hyperparameters -------------------------------------------------
 
 DEFAULT_MODEL_TYPE: Final[str] = "rf"
@@ -90,11 +98,12 @@ RF_DEFAULTS: Final[dict[str, int]] = {
 
 # Torch MLP defaults.
 #
-# ``patience`` and ``es_val_fraction`` drive early stopping: a random
-# ``es_val_fraction`` of the training rows is held out each fit, validation RMSE
-# is tracked after every epoch, the best weights are restored, and training
-# stops once RMSE fails to improve for ``patience`` consecutive epochs. Set
-# ``patience`` to ``0`` to disable early stopping and always run ``epochs``.
+# ``patience`` and ``es_val_fraction`` drive early stopping: a cold-protein
+# holdout targeting ``es_val_fraction`` of the training rows is carved each
+# fit (no protein overlap with the fit set), validation AUROC is tracked after
+# every epoch, the best weights are restored, and training stops once AUROC
+# fails to improve for ``patience`` consecutive epochs. Set ``patience`` to
+# ``0`` to disable early stopping and always run ``epochs``.
 # ``use_batchnorm`` inserts BatchNorm1d after each hidden linear layer.
 # ``use_bilinear`` adds a learned protein/ligand bilinear interaction block: the
 # protein and ligand embeddings are projected to ``bilinear_dim`` and combined by

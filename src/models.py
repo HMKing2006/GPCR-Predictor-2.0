@@ -1,8 +1,8 @@
-"""Regressors with a shared fit/predict/save/load interface.
+"""Binary classifiers with a shared fit/predict/save/load interface.
 
 Two model families are provided:
 
-* :class:`RandomForestModel` - a scikit-learn ``RandomForestRegressor`` grown
+* :class:`RandomForestModel` - a scikit-learn ``RandomForestClassifier`` grown
   with ``warm_start=True``. Trees are added in batches, each batch fit on a
   contiguous row-shard read from the (memmapped) training matrix, keeping peak
   memory near a single shard plus the incremental tree batch rather than the
@@ -12,7 +12,7 @@ Two model families are provided:
 
 Both expose ``fit``, ``predict``, ``save`` and ``load`` and carry a ``metadata``
 dict (embedding model ids, dims) so prediction can reconstruct features
-identically.
+identically. ``predict`` returns positive-class probabilities in ``[0, 1]``.
 """
 
 from __future__ import annotations
@@ -23,17 +23,23 @@ from typing import Any, Optional
 import joblib
 import numpy as np
 import torch
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestClassifier
 from torch import nn
 
 import config
 from src.embeddings import select_device
+from src.metrics import auroc
+from src.splits import cold_protein_split
 
 _PREDICT_CHUNK: int = 100_000
 
 
 class BaseRegressor:
-    """Common interface and joblib persistence for regressors."""
+    """Common interface and joblib persistence for classifiers.
+
+    The historical ``BaseRegressor`` name is kept so existing imports continue to
+    work after the binder/non-binder cutover.
+    """
 
     model_type: str = "base"
 
@@ -46,7 +52,7 @@ class BaseRegressor:
 
         Args:
             X: Feature matrix ``(n, d)`` (may be a memmap).
-            y: Target vector ``(n,)``.
+            y: Binary target vector ``(n,)`` with labels in ``{0, 1}``.
             verbose: If ``True``, print progress.
 
         Returns:
@@ -58,13 +64,13 @@ class BaseRegressor:
         raise NotImplementedError
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Predict targets for ``X``.
+        """Predict positive-class probabilities for ``X``.
 
         Args:
             X: Feature matrix ``(n, d)``.
 
         Returns:
-            Predicted values ``(n,)``.
+            Probabilities ``(n,)`` in ``[0, 1]``.
 
         Raises:
             NotImplementedError: Always; subclasses must override.
@@ -98,7 +104,7 @@ class BaseRegressor:
 
 
 class RandomForestModel(BaseRegressor):
-    """Warm-start random forest with sharded, memory-bounded training."""
+    """Warm-start random forest classifier with sharded, memory-bounded training."""
 
     model_type = "rf"
 
@@ -128,7 +134,7 @@ class RandomForestModel(BaseRegressor):
         self.batch_trees = int(batch_trees)
         self.shard_rows = int(shard_rows)
         self.seed = int(seed)
-        self.forest = RandomForestRegressor(
+        self.forest = RandomForestClassifier(
             n_estimators=0,
             warm_start=True,
             max_depth=None if max_depth in (0, None) else int(max_depth),
@@ -142,7 +148,7 @@ class RandomForestModel(BaseRegressor):
 
         Args:
             X: Feature matrix ``(n, d)`` (may be a memmap).
-            y: Target vector ``(n,)``.
+            y: Binary target vector ``(n,)`` with labels in ``{0, 1}``.
             verbose: If ``True``, print progress after each round.
 
         Returns:
@@ -152,6 +158,7 @@ class RandomForestModel(BaseRegressor):
         shard = min(self.shard_rows, n_rows)
         n_rounds = math.ceil(self.n_estimators / self.batch_trees)
         trees = 0
+        y = np.asarray(y)
         for round_idx in range(n_rounds):
             trees = min(self.n_estimators, trees + self.batch_trees)
             self.forest.n_estimators = trees
@@ -173,19 +180,25 @@ class RandomForestModel(BaseRegressor):
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Predict in row chunks to bound memory.
+        """Predict binder probabilities in row chunks to bound memory.
 
         Args:
             X: Feature matrix ``(n, d)``.
 
         Returns:
-            Predicted values ``(n,)``.
+            Positive-class probabilities ``(n,)``.
         """
         n_rows = X.shape[0]
         out = np.empty(n_rows, dtype=np.float32)
+        classes = np.asarray(self.forest.classes_)
+        pos_matches = np.flatnonzero(classes == 1)
+        if pos_matches.size == 0:
+            pos_matches = np.flatnonzero(classes == 1.0)
+        pos_col = int(pos_matches[0])
         for start in range(0, n_rows, _PREDICT_CHUNK):
             end = min(start + _PREDICT_CHUNK, n_rows)
-            out[start:end] = self.forest.predict(np.asarray(X[start:end]))
+            probs = self.forest.predict_proba(np.asarray(X[start:end]))
+            out[start:end] = probs[:, pos_col]
         return out
 
     def _state(self) -> dict[str, Any]:
@@ -284,7 +297,7 @@ class _MLP(nn.Module):
 
 
 class MLPModel(BaseRegressor):
-    """PyTorch MLP regressor trained with minibatch SGD from a memmap."""
+    """PyTorch MLP classifier trained with minibatch SGD from a memmap."""
 
     model_type = "mlp"
 
@@ -318,11 +331,12 @@ class MLPModel(BaseRegressor):
             epochs: Maximum number of training epochs.
             learning_rate: Adam learning rate.
             weight_decay: Adam weight decay.
-            patience: Epochs without validation-RMSE improvement tolerated before
+            patience: Epochs without validation-AUROC improvement tolerated before
                 stopping early. ``0`` disables early stopping.
-            es_val_fraction: Fraction of training rows held out to monitor
-                validation RMSE for early stopping.
-            es_min_delta: Minimum validation-RMSE decrease counted as an
+            es_val_fraction: Target fraction of training *rows* held out as a
+                cold-protein early-stopping set (proteins disjoint from the
+                fit set).
+            es_min_delta: Minimum validation-AUROC increase counted as an
                 improvement.
             use_batchnorm: If ``True``, add BatchNorm1d after each hidden layer.
             use_bilinear: If ``True``, append a learned bilinear protein/ligand
@@ -357,25 +371,31 @@ class MLPModel(BaseRegressor):
         self.feature_mean: Optional[np.ndarray] = None
         self.feature_std: Optional[np.ndarray] = None
 
-    def _standardize_stats(self, X: np.ndarray) -> None:
-        """Compute per-feature mean and std over the training matrix in chunks.
+    def _standardize_stats(self, X: np.ndarray, rows: Optional[np.ndarray] = None) -> None:
+        """Compute per-feature mean and std over selected rows in chunks.
 
         Args:
             X: Feature matrix ``(n, d)``.
+            rows: Optional row indices to include. When ``None``, uses every row.
 
         Returns:
             None. Sets ``feature_mean`` and ``feature_std`` in place.
         """
-        n, d = X.shape
+        if rows is None:
+            rows = np.arange(X.shape[0], dtype=np.int64)
+        else:
+            rows = np.asarray(rows, dtype=np.int64)
+        n = int(rows.shape[0])
+        d = X.shape[1]
         total = np.zeros(d, dtype=np.float64)
         total_sq = np.zeros(d, dtype=np.float64)
         for start in range(0, n, _PREDICT_CHUNK):
-            end = min(start + _PREDICT_CHUNK, n)
-            chunk = np.asarray(X[start:end], dtype=np.float64)
+            batch_rows = rows[start : start + _PREDICT_CHUNK]
+            chunk = np.asarray(X[batch_rows], dtype=np.float64)
             total += chunk.sum(axis=0)
             total_sq += (chunk**2).sum(axis=0)
-        mean = total / n
-        var = np.maximum(total_sq / n - mean**2, 1e-8)
+        mean = total / max(n, 1)
+        var = np.maximum(total_sq / max(n, 1) - mean**2, 1e-8)
         self.feature_mean = mean.astype(np.float32)
         self.feature_std = np.sqrt(var).astype(np.float32)
 
@@ -393,50 +413,120 @@ class MLPModel(BaseRegressor):
         batch = (batch - self.feature_mean) / self.feature_std
         return torch.from_numpy(batch).to(self.device)
 
-    def _eval_rmse(self, X: np.ndarray, rows: np.ndarray, y: np.ndarray) -> float:
-        """Compute validation RMSE over a set of rows without tracking grads.
+    def _predict_logits(self, X: np.ndarray, rows: np.ndarray) -> np.ndarray:
+        """Run the network on selected rows and return raw logits on CPU.
+
+        Args:
+            X: Feature matrix ``(n, d)``.
+            rows: Integer row indices to score.
+
+        Returns:
+            Logits as a ``float32`` numpy array ``(len(rows),)``.
+        """
+        assert self.net is not None
+        self.net.eval()
+        chunks: list[np.ndarray] = []
+        with torch.no_grad():
+            for start in range(0, rows.shape[0], _PREDICT_CHUNK):
+                batch_rows = rows[start : start + _PREDICT_CHUNK]
+                logits = self.net(self._batch_tensor(X, batch_rows)).detach().to("cpu").numpy()
+                chunks.append(logits.astype(np.float32, copy=False))
+        return np.concatenate(chunks) if chunks else np.empty(0, dtype=np.float32)
+
+    def _eval_auroc(self, X: np.ndarray, rows: np.ndarray, y: np.ndarray) -> float:
+        """Compute validation AUROC over a set of rows without tracking grads.
 
         Args:
             X: Feature matrix ``(n, d)``.
             rows: Integer row indices to evaluate.
-            y: Full target vector ``(n,)`` (indexed by ``rows``).
+            y: Full binary target vector ``(n,)`` (indexed by ``rows``).
 
         Returns:
-            The root-mean-squared error on ``rows``.
+            The AUROC on ``rows``.
         """
-        assert self.net is not None
-        self.net.eval()
-        sq_err = 0.0
-        with torch.no_grad():
-            for start in range(0, rows.shape[0], _PREDICT_CHUNK):
-                batch_rows = rows[start : start + _PREDICT_CHUNK]
-                pred = self.net(self._batch_tensor(X, batch_rows)).detach().to("cpu").numpy()
-                sq_err += float(np.sum((pred - y[batch_rows]) ** 2))
-        return math.sqrt(sq_err / rows.shape[0])
+        logits = self._predict_logits(X, rows)
+        probs = 1.0 / (1.0 + np.exp(-logits))
+        return auroc(y[rows], probs)
 
-    def fit(self, X: np.ndarray, y: np.ndarray, verbose: bool = True) -> "MLPModel":
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        verbose: bool = True,
+        groups: Optional[np.ndarray] = None,
+    ) -> "MLPModel":
         """Train the MLP with minibatch Adam and validation early stopping.
 
-        A random ``es_val_fraction`` of the rows is held out as an internal
-        validation set. After each epoch the validation RMSE is measured; the
-        best-performing weights are cached and restored at the end, and training
-        stops early once RMSE fails to improve by ``es_min_delta`` for
-        ``patience`` consecutive epochs. Early stopping is skipped when
-        ``patience`` is ``0`` or the dataset is too small to hold out a batch.
+        When ``patience > 0``, a cold-protein holdout of about
+        ``es_val_fraction`` of the rows is carved from ``groups`` so no protein
+        appears in both the fit set and the early-stopping set. After each epoch
+        the holdout AUROC is measured; the best-performing weights are cached
+        and restored at the end, and training stops early once AUROC fails to
+        improve by ``es_min_delta`` for ``patience`` consecutive epochs. Early
+        stopping is skipped when ``patience`` is ``0``.
 
         Args:
             X: Feature matrix ``(n, d)`` (may be a memmap).
-            y: Target vector ``(n,)``.
+            y: Binary target vector ``(n,)`` with labels in ``{0, 1}``.
             verbose: If ``True``, print periodic batch and per-epoch loss.
+            groups: Per-row protein group ids aligned with ``X`` / ``y``.
+                Required when early stopping is enabled.
 
         Returns:
             ``self``.
+
+        Raises:
+            ValueError: If early stopping is enabled but ``groups`` is missing
+                or has the wrong length.
         """
         torch.manual_seed(self.seed)
         rng = np.random.default_rng(self.seed)
         n, d = X.shape
         self.input_dim = int(d)
-        self._standardize_stats(X)
+        y_np = np.asarray(y, dtype=np.float32)
+        y_t = torch.from_numpy(y_np)
+
+        if self.patience > 0:
+            if groups is None:
+                raise ValueError(
+                    "MLP early stopping requires protein groups for a cold-protein holdout."
+                )
+            groups_arr = np.asarray(groups)
+            if groups_arr.shape[0] != n:
+                raise ValueError(
+                    f"groups length {groups_arr.shape[0]} does not match X rows {n}."
+                )
+            es_split = cold_protein_split(
+                groups_arr,
+                {
+                    "train": 1.0 - self.es_val_fraction,
+                    "es_val": self.es_val_fraction,
+                },
+                seed=self.seed,
+            )
+            train_rows = es_split["train"]
+            val_rows = es_split["es_val"]
+            early_stopping = train_rows.shape[0] > 0 and val_rows.shape[0] > 0
+            if verbose and early_stopping:
+                n_train_prot = int(np.unique(groups_arr[train_rows]).shape[0])
+                n_val_prot = int(np.unique(groups_arr[val_rows]).shape[0])
+                print(
+                    f"[mlp] cold-protein early-stop holdout: "
+                    f"train={train_rows.shape[0]} rows / {n_train_prot} proteins, "
+                    f"es_val={val_rows.shape[0]} rows / {n_val_prot} proteins",
+                    flush=True,
+                )
+        else:
+            train_rows = np.arange(n, dtype=np.int64)
+            val_rows = np.empty(0, dtype=np.int64)
+            early_stopping = False
+
+        if not early_stopping and self.patience > 0:
+            train_rows = np.arange(n, dtype=np.int64)
+            if verbose:
+                print("[mlp] early stopping disabled (empty cold-protein holdout)", flush=True)
+
+        self._standardize_stats(X, train_rows)
         self.net = _MLP(
             d,
             self.hidden_dim,
@@ -451,17 +541,8 @@ class MLPModel(BaseRegressor):
         optimizer = torch.optim.Adam(
             self.net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
         )
-        loss_fn = nn.MSELoss()
-        y_np = np.asarray(y, dtype=np.float32)
-        y_t = torch.from_numpy(y_np)
-
-        perm = rng.permutation(n)
-        val_count = int(round(self.es_val_fraction * n)) if self.patience > 0 else 0
-        val_count = min(val_count, n - 1) if val_count > 0 else 0
-        val_rows = perm[:val_count]
-        train_rows = perm[val_count:]
-        early_stopping = val_count > 0
-        best_rmse = math.inf
+        loss_fn = nn.BCEWithLogitsLoss()
+        best_auroc = -math.inf
         best_state: Optional[dict[str, torch.Tensor]] = None
         best_epoch = 0
         no_improve = 0
@@ -492,19 +573,19 @@ class MLPModel(BaseRegressor):
                         flush=True,
                     )
 
-            val_rmse = self._eval_rmse(X, val_rows, y_np) if early_stopping else math.nan
+            val_auroc = self._eval_auroc(X, val_rows, y_np) if early_stopping else math.nan
             if verbose:
-                tail = f"  val_rmse={val_rmse:.4f}" if early_stopping else ""
+                tail = f"  val_auroc={val_auroc:.4f}" if early_stopping else ""
                 print(
                     f"[mlp] epoch {epoch + 1}/{self.epochs} done  "
-                    f"train_mse={running / max(seen, 1):.4f}{tail}",
+                    f"train_bce={running / max(seen, 1):.4f}{tail}",
                     flush=True,
                 )
 
             if not early_stopping:
                 continue
-            if best_rmse - val_rmse > self.es_min_delta:
-                best_rmse = val_rmse
+            if val_auroc - best_auroc > self.es_min_delta:
+                best_auroc = val_auroc
                 best_epoch = epoch + 1
                 best_state = {k: v.detach().cpu().clone() for k, v in self.net.state_dict().items()}
                 no_improve = 0
@@ -514,7 +595,7 @@ class MLPModel(BaseRegressor):
                     if verbose:
                         print(
                             f"[mlp] early stop at epoch {epoch + 1}; "
-                            f"best val_rmse={best_rmse:.4f} @ epoch {best_epoch}",
+                            f"best val_auroc={best_auroc:.4f} @ epoch {best_epoch}",
                             flush=True,
                         )
                     break
@@ -522,29 +603,23 @@ class MLPModel(BaseRegressor):
         if best_state is not None:
             self.net.load_state_dict(best_state)
             if verbose:
-                print(f"[mlp] restored best weights (val_rmse={best_rmse:.4f} @ epoch {best_epoch})")
+                print(
+                    f"[mlp] restored best weights (val_auroc={best_auroc:.4f} @ epoch {best_epoch})"
+                )
         return self
-
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Predict in chunks with the trained network.
+        """Predict binder probabilities in chunks with the trained network.
 
         Args:
             X: Feature matrix ``(n, d)``.
 
         Returns:
-            Predicted values ``(n,)``.
+            Positive-class probabilities ``(n,)``.
         """
         assert self.net is not None, "Model must be fit or loaded before predict."
-        self.net.eval()
-        n = X.shape[0]
-        out = np.empty(n, dtype=np.float32)
-        with torch.no_grad():
-            for start in range(0, n, _PREDICT_CHUNK):
-                end = min(start + _PREDICT_CHUNK, n)
-                rows = np.arange(start, end)
-                xb = self._batch_tensor(X, rows)
-                out[start:end] = self.net(xb).detach().to("cpu").numpy()
-        return out
+        rows = np.arange(X.shape[0])
+        logits = self._predict_logits(X, rows)
+        return (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
 
     def _state(self) -> dict[str, Any]:
         """Return the picklable payload (weights, scaler and hyperparameters).
@@ -584,7 +659,7 @@ def build_model(model_type: str, seed: int = config.RANDOM_SEED, **hyperparams: 
         **hyperparams: Model-specific hyperparameters overriding defaults.
 
     Returns:
-        An unfitted :class:`BaseRegressor`.
+        An unfitted classifier (:class:`BaseRegressor` interface).
 
     Raises:
         ValueError: If ``model_type`` is unknown.
