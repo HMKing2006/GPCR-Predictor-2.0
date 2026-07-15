@@ -8,9 +8,10 @@ Feature construction runs in two streaming passes over the prepared rows:
    ``float32`` memmap ``X`` of shape ``(n_rows, feature_dim)`` in row chunks so
    peak RAM stays bounded even for tens of millions of rows.
 
-Built datasets are keyed by a signature over the source CSV, row limit and both
-model identifiers, so repeated ``train.py``/``grid_search.py`` invocations reuse
-the same matrix instead of recomputing it.
+Built datasets are keyed by a signature over the source CSV, row limit, protein
+model, and the canonical ligand-representation spec, so repeated
+``train.py``/``grid_search.py`` invocations reuse the same matrix instead of
+recomputing it.
 """
 
 from __future__ import annotations
@@ -25,7 +26,8 @@ import numpy as np
 
 import config
 from src.data_prep import iter_prepared_rows
-from src.embeddings import HFEmbedder, ligand_embedder, protein_embedder
+from src.embeddings import HFEmbedder, protein_embedder
+from src.ligand_repr import CompositeLigandFeaturizer, canonical_ligand_repr, parse_ligand_repr
 from src.lmdb_cache import EmbeddingCache
 
 _ASSAY_TO_INDEX: dict[str, int] = {name: i for i, name in enumerate(config.ASSAY_TYPES)}
@@ -181,37 +183,39 @@ def _signature(csv_path: str, limit: Optional[int], protein_model: str, ligand_m
         csv_path: Source CSV path.
         limit: Row limit used (or ``None``).
         protein_model: Protein model identifier.
-        ligand_model: Ligand model identifier.
+        ligand_model: Ligand representation spec (canonicalized before hashing).
 
     Returns:
         A short hex digest identifying this configuration.
     """
-    key = f"{os.path.basename(csv_path)}|{limit}|{protein_model}|{ligand_model}"
+    ligand_key = canonical_ligand_repr(ligand_model)
+    key = f"{os.path.basename(csv_path)}|{limit}|{protein_model}|{ligand_key}"
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 
 def _build_ligand_emb_memmap(
-    ligands: list[str], cache: EmbeddingCache, dim: int, path: str, verbose: bool = True
+    ligands: list[str],
+    featurizer: CompositeLigandFeaturizer,
+    path: str,
+    verbose: bool = True,
 ) -> np.memmap:
-    """Materialize unique ligand embeddings into an indexable memmap.
+    """Materialize unique concatenated ligand vectors into an indexable memmap.
 
     Args:
         ligands: Distinct ligand SMILES in index order.
-        cache: Ligand embedding cache.
-        dim: Ligand embedding dimensionality.
+        featurizer: Composite ligand featurizer whose component caches are filled.
         path: Destination memmap path.
         verbose: If ``True``, print periodic progress.
 
     Returns:
-        A memmap of shape ``(len(ligands), dim)``.
+        A memmap of shape ``(len(ligands), featurizer.dim)``.
     """
     total = len(ligands)
+    dim = featurizer.dim
     mm = np.memmap(path, dtype=np.float32, mode="w+", shape=(total, dim))
     for start in range(0, total, _ROW_CHUNK):
         chunk = ligands[start : start + _ROW_CHUNK]
-        vecs = cache.get_many(chunk)
-        for offset, smiles in enumerate(chunk):
-            mm[start + offset] = vecs[smiles]
+        mm[start : start + len(chunk)] = featurizer.vectors_for(chunk)
         if verbose:
             print(
                 f"[features] gathering ligand vectors {min(start + _ROW_CHUNK, total)}/{total}",
@@ -235,7 +239,8 @@ def build_features(
     Args:
         csv_path: Source BindingDB CSV.
         protein_model: ESM-2 model identifier.
-        ligand_model: Ligand (MoLFormer-XL) model identifier.
+        ligand_model: Ligand representation spec (HF model id, reserved RDKit
+            token, or a comma-separated combination).
         limit: Optional cap on raw rows read (for smoke tests).
         verbose: If ``True``, print progress.
         rebuild: If ``True``, rebuild even when a cached build exists.
@@ -252,7 +257,14 @@ def build_features(
             meta = json.load(handle)
         if verbose:
             print(f"[features] reusing cached build at {directory} ({meta['n_rows']} rows)")
-        return FeatureDataset(directory=directory, **meta)
+        return FeatureDataset(
+            directory=directory,
+            n_rows=meta["n_rows"],
+            n_features=meta["n_features"],
+            protein_dim=meta["protein_dim"],
+            ligand_dim=meta["ligand_dim"],
+            signature=meta["signature"],
+        )
 
     os.makedirs(directory, exist_ok=True)
 
@@ -307,14 +319,21 @@ def build_features(
             protein_matrix[i] = got[seq]
     del pemb
 
-    lemb: HFEmbedder = ligand_embedder(ligand_model, device=device)
-    ligand_dim = lemb.dim
-    with EmbeddingCache("ligand", ligand_model) as lcache:
-        lemb.ensure_cached(ligands, lcache, verbose=verbose)
-        ligand_matrix = _build_ligand_emb_memmap(
-            ligands, lcache, ligand_dim, os.path.join(directory, "ligand_emb.dat"), verbose=verbose
+    ligand_featurizer = parse_ligand_repr(ligand_model, device=device)
+    if verbose:
+        print(
+            f"[features] ligand representation: {ligand_featurizer.canonical_spec} "
+            f"({ligand_featurizer.dim}-d: {ligand_featurizer.component_dims})",
+            flush=True,
         )
-    del lemb
+    ligand_featurizer.ensure_cached(ligands, verbose=verbose)
+    ligand_dim = ligand_featurizer.dim
+    ligand_matrix = _build_ligand_emb_memmap(
+        ligands,
+        ligand_featurizer,
+        os.path.join(directory, "ligand_emb.dat"),
+        verbose=verbose,
+    )
 
     # Pass 2: fill the feature memmap in row chunks.
     n_features = config.feature_dim(protein_dim, ligand_dim)
@@ -347,10 +366,19 @@ def build_features(
         "protein_dim": protein_dim,
         "ligand_dim": ligand_dim,
         "signature": signature,
+        "ligand_model": ligand_featurizer.canonical_spec,
+        "ligand_component_dims": ligand_featurizer.component_dims,
     }
     with open(meta_path, "w") as handle:
         json.dump(meta, handle, indent=2)
 
     if verbose:
         print(f"[features] build complete: {directory}")
-    return FeatureDataset(directory=directory, **meta)
+    return FeatureDataset(
+        directory=directory,
+        n_rows=n_rows,
+        n_features=n_features,
+        protein_dim=protein_dim,
+        ligand_dim=ligand_dim,
+        signature=signature,
+    )

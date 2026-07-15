@@ -53,7 +53,16 @@ _TYPE_TO_ASSAY: list[tuple[str, str]] = [
     ("type_EC50", "EC50 (nM)"),
 ]
 
-_ACTIVITY_TYPES: list[str] = ["Ki", "KD", "IC50", "EC50"]
+_TYPE_COLUMNS: list[str] = [col for col, _ in _TYPE_TO_ASSAY]
+_QUALITY_LEVELS: tuple[str, ...] = ("low", "medium", "high")
+_EXPLODE_COLUMNS: tuple[str, ...] = (
+    "type_Ki",
+    "type_KD",
+    "type_IC50",
+    "type_EC50",
+    "relation",
+    "pchembl_value",
+)
 
 
 def _require_papyrus() -> None:
@@ -305,6 +314,175 @@ def pchembl_to_nm(pchembl: float) -> Optional[float]:
     return float(activity_nm)
 
 
+def _type_flag_true(series: pd.Series) -> pd.Series:
+    """Return a boolean mask for Papyrus type_* columns set to active.
+
+    Args:
+        series: A ``type_Ki`` / ``type_KD`` / ``type_IC50`` / ``type_EC50`` column.
+
+    Returns:
+        Boolean Series aligned with ``series``.
+    """
+    if series.dtype == bool:
+        return series.fillna(False)
+    as_str = series.astype(str).str.strip().str.lower()
+    return as_str.isin({"1", "1.0", "true", "yes"})
+
+
+def _filter_quality(chunk: pd.DataFrame, min_quality: str) -> pd.DataFrame:
+    """Keep rows at or above a Papyrus quality tier.
+
+    Args:
+        chunk: Raw Papyrus activity chunk.
+        min_quality: Minimum tier (``high`` / ``medium`` / ``low``).
+
+    Returns:
+        Filtered chunk; unchanged when ``Quality`` is absent.
+    """
+    if "Quality" not in chunk.columns:
+        return chunk
+    tier = min_quality.lower()
+    if tier not in _QUALITY_LEVELS:
+        raise ValueError(f"min_quality must be one of {_QUALITY_LEVELS}")
+    keep = _QUALITY_LEVELS[_QUALITY_LEVELS.index(tier) :]
+    return chunk[chunk["Quality"].astype(str).str.lower().isin(keep)]
+
+
+def _filter_exact_relation(chunk: pd.DataFrame) -> pd.DataFrame:
+    """Keep only exact (``=``) quantitative relations.
+
+    Args:
+        chunk: Papyrus activity chunk.
+
+    Returns:
+        Filtered chunk; unchanged when ``relation`` is absent.
+    """
+    if "relation" not in chunk.columns:
+        return chunk
+    return chunk[chunk["relation"].astype(str).str.strip() == "="]
+
+
+def _explode_semicolon_rows(chunk: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
+    """Explode rows whose semicolon-separated fields encode multiple measurements.
+
+    Args:
+        chunk: Rows containing at least one semicolon-separated field.
+        columns: Column names that may contain semicolon-separated values.
+
+    Returns:
+        One row per exploded measurement, with list lengths equalized by
+        repeating the last value in each field (matching papyrus-scripts).
+    """
+    if chunk.empty:
+        return chunk
+    cols = [col for col in columns if col in chunk.columns]
+    if not cols:
+        return chunk
+
+    exploded_rows: list[pd.Series] = []
+    for _, row in chunk.iterrows():
+        split_values: dict[str, list[str]] = {}
+        max_len = 1
+        for col in cols:
+            parts = [part.strip() for part in str(row[col]).split(";")]
+            split_values[col] = parts
+            max_len = max(max_len, len(parts))
+        for col in cols:
+            parts = split_values[col]
+            if len(parts) < max_len:
+                parts = parts + [parts[-1]] * (max_len - len(parts))
+            split_values[col] = parts
+        for idx in range(max_len):
+            new_row = row.copy()
+            for col in cols:
+                new_row[col] = split_values[col][idx]
+            exploded_rows.append(new_row)
+    if not exploded_rows:
+        return chunk.iloc[0:0]
+    return pd.DataFrame(exploded_rows)
+
+
+def _filter_activity_types(chunk: pd.DataFrame) -> pd.DataFrame:
+    """Keep Ki/Kd/IC50/EC50 rows without papyrus-scripts chunked ``keep_type``.
+
+    The upstream ``keep_type`` helper spins up joblib/swifter workers per chunk
+    and, when chained through generators, can terminate the stream early. This
+    replacement mirrors the simple and semicolon-exploded paths only.
+
+    Args:
+        chunk: Papyrus activity chunk.
+
+    Returns:
+        Rows whose assay-type flags match one of the supported types.
+    """
+    type_cols = [col for col in _TYPE_COLUMNS if col in chunk.columns]
+    if not type_cols:
+        return chunk.iloc[0:0]
+
+    def _matching_types(df: pd.DataFrame) -> pd.DataFrame:
+        active = pd.Series(False, index=df.index)
+        clean = pd.Series(True, index=df.index)
+        for col in type_cols:
+            active |= _type_flag_true(df[col])
+            clean &= ~df[col].astype(str).str.contains(";", na=False)
+        return df[active & clean]
+
+    multi_mask = pd.Series(False, index=chunk.index)
+    for col in type_cols:
+        multi_mask |= chunk[col].astype(str).str.contains(";", na=False)
+
+    parts: list[pd.DataFrame] = []
+    simple = _matching_types(chunk[~multi_mask])
+    if not simple.empty:
+        parts.append(simple)
+    if multi_mask.any():
+        exploded = _explode_semicolon_rows(chunk[multi_mask], _EXPLODE_COLUMNS)
+        exploded = _filter_exact_relation(exploded)
+        exploded = _matching_types(exploded)
+        if not exploded.empty:
+            parts.append(exploded)
+    if not parts:
+        return chunk.iloc[0:0]
+    return pd.concat(parts, ignore_index=True)
+
+
+def _expected_raw_rows(
+    version: str,
+    plusplus: bool,
+    papyrus_root: Optional[str],
+) -> Optional[int]:
+    """Read the expected raw row count from Papyrus ``data_size.json``.
+
+    Args:
+        version: Papyrus version string.
+        plusplus: Whether the Papyrus++ subset is being built.
+        papyrus_root: Optional Papyrus data directory override.
+
+    Returns:
+        Expected raw row count, or ``None`` when metadata is unavailable.
+    """
+    import json
+    from pathlib import Path
+
+    from papyrus_scripts.utils.IO import process_data_version
+
+    try:
+        if papyrus_root is not None:
+            os.environ["PYSTOW_HOME"] = os.path.abspath(papyrus_root)
+        import pystow
+
+        resolved = process_data_version(version=version, root_folder=papyrus_root)
+        size_path = Path(pystow.module("papyrus", resolved.version_old_fmt).base.as_posix()) / "data_size.json"
+        if not size_path.exists():
+            return None
+        payload = json.loads(size_path.read_text())
+        key = "papyrus_++" if plusplus else "papyrus_2D"
+        value = payload.get(key)
+        return int(value) if value is not None else None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
 def _assay_column(row: pd.Series) -> Optional[str]:
     """Pick the BindingDB assay column for a Papyrus activity row.
 
@@ -415,6 +593,10 @@ def iter_filtered_chunks(
 ) -> Iterator[pd.DataFrame]:
     """Yield filtered Papyrus activity chunks ready for conversion.
 
+    Filters are applied directly per raw chunk instead of chaining
+    ``papyrus_scripts.preprocess.keep_quality`` and ``keep_type`` generators,
+    which can terminate early on the full ~60M-row release.
+
     Args:
         version: Papyrus version string.
         plusplus: If ``True``, read Papyrus++; otherwise the full set.
@@ -428,7 +610,6 @@ def iter_filtered_chunks(
         Filtered pandas DataFrames.
     """
     from papyrus_scripts import read_papyrus
-    from papyrus_scripts.preprocess import keep_quality, keep_type
 
     if verbose:
         label = "Papyrus++" if plusplus else "full Papyrus"
@@ -437,6 +618,12 @@ def iter_filtered_chunks(
             f"chunk_size={chunk_size}",
             flush=True,
         )
+        if not plusplus:
+            print(f"[papyrus] applying min_quality={min_quality!r}", flush=True)
+        expected = _expected_raw_rows(version, plusplus, papyrus_root)
+        if expected is not None:
+            print(f"[papyrus] expected raw rows in source file: {expected:,}", flush=True)
+
     reader = read_papyrus(
         is3d=False,
         version=version,
@@ -444,24 +631,33 @@ def iter_filtered_chunks(
         chunksize=chunk_size,
         source_path=papyrus_root,
     )
-    # read_papyrus with chunksize returns an iterator / TextFileReader.
-    stream: Any = reader
-    if not plusplus:
-        stream = keep_quality(data=stream, min_quality=min_quality)
-        if verbose:
-            print(f"[papyrus] applying min_quality={min_quality!r}", flush=True)
-    stream = keep_type(data=stream, activity_types=_ACTIVITY_TYPES, njobs=1, verbose=False)
-
-    for chunk_idx, chunk in enumerate(stream, start=1):
-        if not isinstance(chunk, pd.DataFrame):
+    raw_rows = 0
+    raw_idx = 0
+    for raw_idx, chunk in enumerate(reader, start=1):
+        if not isinstance(chunk, pd.DataFrame) or chunk.empty:
             continue
-        if "relation" in chunk.columns:
-            chunk = chunk[chunk["relation"].astype(str).str.strip() == "="]
+        raw_rows += len(chunk)
+        if not plusplus:
+            chunk = _filter_quality(chunk, min_quality)
+        chunk = _filter_activity_types(chunk)
+        chunk = _filter_exact_relation(chunk)
         if chunk.empty:
+            if verbose and raw_idx % 10 == 0:
+                print(
+                    f"[papyrus] read {raw_idx} raw chunks ({raw_rows:,} rows)...",
+                    flush=True,
+                )
             continue
-        if verbose and chunk_idx % 5 == 0:
-            print(f"[papyrus] processed {chunk_idx} chunks...", flush=True)
+        if verbose and raw_idx % 10 == 0:
+            print(
+                f"[papyrus] read {raw_idx} raw chunks ({raw_rows:,} rows), "
+                f"latest filtered chunk={len(chunk):,}",
+                flush=True,
+            )
         yield chunk
+
+    if verbose:
+        print(f"[papyrus] finished reading {raw_idx} raw chunks ({raw_rows:,} rows)", flush=True)
 
 
 def run_build(args: argparse.Namespace) -> str:
@@ -500,6 +696,7 @@ def run_build(args: argparse.Namespace) -> str:
     seen_ligands: set[str] = set()
     seen_proteins: set[str] = set()
     rows_written = 0
+    expected_raw = _expected_raw_rows(resolved_version, plusplus, args.papyrus_root)
 
     with open(output, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=_OUTPUT_COLUMNS, extrasaction="ignore")
@@ -539,6 +736,18 @@ def run_build(args: argparse.Namespace) -> str:
             f"sequence={stats['skipped_sequence']}  smiles={stats['skipped_smiles']}",
             flush=True,
         )
+        if (
+            not plusplus
+            and expected_raw is not None
+            and stats["written"] < expected_raw * 0.05
+        ):
+            print(
+                "[papyrus] warning: output row count is far below the raw Papyrus 2D "
+                f"size ({expected_raw:,}). This usually means the source file was "
+                "not fully streamed; rebuild with --no-download after verifying the "
+                "download under ~/.data/papyrus.",
+                flush=True,
+            )
     if stats["written"] == 0:
         raise RuntimeError(
             "No rows written. Check that Papyrus data downloaded correctly and "

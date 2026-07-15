@@ -36,7 +36,10 @@ ASSAY_COLUMNS: dict[str, str] = {
     "EC50": "EC50 (nM)",
     "Ki": "Ki (nM)",
     "Kd": "Kd (nM)",
+    "Other": "Other (nM)",
 }
+
+COL_ACTIVITY_LABEL = "Activity Label"
 
 # Allow very long single-cell sequences without hitting the csv field limit.
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
@@ -52,7 +55,10 @@ class PreparedRow:
         assay_type: One of ``config.ASSAY_TYPES``.
         ph: Assay pH (imputed to the default when missing).
         temp: Assay temperature in Celsius (imputed to the default when missing).
-        pactivity: Target label, ``-log10(activity_nM * 1e-9)``.
+        pactivity: Continuous target ``-log10(activity_nM * 1e-9)``.
+        activity_label: Optional explicit binder class (``0`` / ``1``) from
+            Papyrus ``Activity_class`` rows. When set, featurization prefers
+            this over binarizing ``pactivity``.
     """
 
     smiles: str
@@ -61,6 +67,7 @@ class PreparedRow:
     ph: float
     temp: float
     pactivity: float
+    activity_label: Optional[float] = None
 
 
 @lru_cache(maxsize=200_000)

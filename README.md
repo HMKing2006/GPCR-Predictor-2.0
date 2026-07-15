@@ -1,10 +1,12 @@
 # GPCR Binder Classifier 2.0
 
 Predicts whether a protein–ligand pair is an active binder (activity ≤ 50 nM) from
-BindingDB or Papyrus data. Ligands are embedded with MoLFormer-XL and proteins with
-ESM-2; both embeddings are cached in LMDB stores named after the models that
-produced them. Models are trained with a cold-protein split and scored by
-classification metrics (AUROC, AUPRC, precision, recall, F1).
+BindingDB or Papyrus data. Ligands can be represented with MoLFormer-XL embeddings,
+Morgan/Avalon fingerprints, RDKit physicochemical descriptors, or any concatenation
+of those. Proteins are embedded with ESM-2. Ligand and protein vectors are cached
+in LMDB stores named after the components that produced them. Models are trained
+with a cold-protein split and scored by classification metrics (AUROC, AUPRC,
+precision, recall, F1).
 
 ## Setup
 
@@ -90,9 +92,45 @@ python grid_search.py --csv data/train/Papyrus_pp_prepared.csv --rebuild-feature
 Each CSV gets its own feature-cache signature and cold-protein splits under
 `cache/features/` and `data/splits/`.
 
+## Ligand representations
+
+`--ligand-model` accepts a Hugging Face SMILES transformer id, a reserved RDKit
+token, or a **comma-separated combination** (concatenated in that order):
+
+| Token | Features |
+|---|---|
+| `morgan` | Morgan/ECFP fingerprint (radius 2, 2048 bits) |
+| `avalon` | Avalon fingerprint (512 bits) |
+| `descriptors` | Full RDKit `Descriptors.descList` (~217 physicochemical features) |
+| `molformer` | Alias for `ibm-research/MoLFormer-XL-both-10pct` (768-d) |
+| any HF model id | Mean-pooled SMILES transformer embedding |
+
+Examples:
+
+```bash
+# Fingerprints only
+python train.py --ligand-model morgan --rebuild-features
+
+# RDKit-only stack
+python train.py --ligand-model morgan,avalon,descriptors --rebuild-features
+
+# Hybrid: Morgan + MoLFormer
+python train.py --ligand-model morgan,molformer --rebuild-features
+
+# Explicit HF id (default when --ligand-model is omitted)
+python train.py --ligand-model ibm-research/MoLFormer-XL-both-10pct
+```
+
+Each component is cached independently under `cache/ligand__*.lmdb`, so adding
+MoLFormer to an existing Morgan cache reuses the Morgan store.
+
 ## Feature vector
 
-`concat(protein_emb[1280], ligand_emb[768], assay_onehot[4], pH[1], temp[1])`
+`concat(protein_emb, ligand_repr, assay_onehot[4], pH[1], temp[1])`
+
+With the default MoLFormer ligand representation this is
+`concat(protein[1280], ligand[768], assay[4], pH, temp)`. With combined
+representations, `ligand` is the concatenation of each selected component.
 
 ## Training
 
@@ -159,7 +197,8 @@ python predict.py --spreadsheet input.csv --assay IC50 --pH 6.5 --temp 37
 
 Outputs include a `P(Active)` column: the predicted probability that activity is
 at most 50 nM (matching the training threshold). Spreadsheet outputs are named
-`*_predictions.<ext>`; pairwise/folder modes write a combined CSV.
+`*_predictions.<ext>`; pairwise/folder modes write a combined CSV. Prediction
+reloads the ligand representation from the saved model's metadata.
 
 ## Project layout
 
@@ -169,6 +208,7 @@ build_papyrus.py     Download Papyrus and write a prepared training CSV.
 src/data_prep.py     Streaming cleaning + label preparation.
 src/lmdb_cache.py    Embedding cache with model-derived DB names.
 src/embeddings.py    ESM-2 and MoLFormer-XL embedders.
+src/ligand_repr.py   Fingerprints, descriptors, composite ligand reps.
 src/featurize.py     Memmapped feature-matrix assembly.
 src/splits.py        Cold-protein splits with save/reuse.
 src/models.py        Warm-start RF + torch MLP classifiers.

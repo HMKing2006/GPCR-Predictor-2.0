@@ -163,7 +163,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--csv", default=config.TRAIN_CSV)
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--protein-model", default=config.DEFAULT_PROTEIN_MODEL)
-    p.add_argument("--ligand-model", default=config.DEFAULT_LIGAND_MODEL)
+    p.add_argument(
+        "--ligand-model",
+        default=config.DEFAULT_LIGAND_MODEL,
+        help=(
+            "Ligand representation: HF model id, reserved token "
+            "(morgan, avalon, descriptors, molformer), or a comma-separated "
+            "combination (e.g. morgan,avalon,molformer)."
+        ),
+    )
     p.add_argument("--seed", type=int, default=config.RANDOM_SEED)
     p.add_argument("--output", default=None, help="Output joblib path for the best model.")
     p.add_argument("--rebuild-features", action="store_true")

@@ -17,6 +17,7 @@ import numpy as np
 import config
 from src.data_prep import binarize_pactivity
 from src.featurize import FeatureDataset, build_features, subset_to_memmap
+from src.ligand_repr import canonical_ligand_repr
 from src.metrics import print_metrics
 from src.models import BaseRegressor, build_model
 from src.splits import train_test_split
@@ -97,7 +98,7 @@ def fit_on_indices(
     model = build_model(model_type, seed=seed, **build_kwargs)
     model.metadata = {
         "protein_model": protein_model,
-        "ligand_model": ligand_model,
+        "ligand_model": canonical_ligand_repr(ligand_model),
         "protein_dim": dataset.protein_dim,
         "ligand_dim": dataset.ligand_dim,
         "n_features": dataset.n_features,
@@ -211,7 +212,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--csv", default=config.TRAIN_CSV, help="Training CSV path.")
     p.add_argument("--limit", type=int, default=None, help="Cap on raw rows (smoke tests).")
     p.add_argument("--protein-model", default=config.DEFAULT_PROTEIN_MODEL)
-    p.add_argument("--ligand-model", default=config.DEFAULT_LIGAND_MODEL)
+    p.add_argument(
+        "--ligand-model",
+        default=config.DEFAULT_LIGAND_MODEL,
+        help=(
+            "Ligand representation: HF model id, reserved token "
+            "(morgan, avalon, descriptors, molformer), or a comma-separated "
+            "combination (e.g. morgan,avalon,molformer)."
+        ),
+    )
     p.add_argument("--test-fraction", type=float, default=config.TEST_FRACTION)
     p.add_argument("--seed", type=int, default=config.RANDOM_SEED)
     p.add_argument("--output", default=None, help="Output joblib path.")

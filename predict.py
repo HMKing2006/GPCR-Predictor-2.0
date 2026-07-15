@@ -31,7 +31,7 @@ import pandas as pd
 
 import config
 from src.data_prep import canonicalize_smiles
-from src.embeddings import ligand_embedder, protein_embedder
+from src.embeddings import protein_embedder
 from src.featurize import assemble_matrix
 from src.io_utils import (
     FASTA_EXTS,
@@ -47,6 +47,7 @@ from src.io_utils import (
     read_table,
     write_table,
 )
+from src.ligand_repr import CompositeLigandFeaturizer, parse_ligand_repr
 from src.lmdb_cache import EmbeddingCache
 from src.models import load_model
 
@@ -77,9 +78,8 @@ class Predictor:
         self.protein_model: str = self.model.metadata["protein_model"]
         self.ligand_model: str = self.model.metadata["ligand_model"]
         self.pemb = protein_embedder(self.protein_model)
-        self.lemb = ligand_embedder(self.ligand_model)
         self.pcache = EmbeddingCache("protein", self.protein_model)
-        self.lcache = EmbeddingCache("ligand", self.ligand_model)
+        self.ligand_featurizer: CompositeLigandFeaturizer = parse_ligand_repr(self.ligand_model)
 
     def close(self) -> None:
         """Close the underlying embedding caches.
@@ -88,7 +88,6 @@ class Predictor:
             None.
         """
         self.pcache.close()
-        self.lcache.close()
 
     def _protein_vectors(self, sequences: Sequence[str]) -> dict[str, np.ndarray]:
         """Ensure sequences are embedded and return their vectors.
@@ -103,16 +102,16 @@ class Predictor:
         return self.pcache.get_many(sequences)
 
     def _ligand_vectors(self, smiles: Sequence[str]) -> dict[str, np.ndarray]:
-        """Ensure ligands are embedded and return their vectors.
+        """Ensure ligands are embedded and return their concatenated vectors.
 
         Args:
             smiles: Canonical ligand SMILES (duplicates tolerated).
 
         Returns:
-            A mapping from SMILES to its embedding vector.
+            A mapping from SMILES to its ligand feature vector.
         """
-        self.lemb.ensure_cached(smiles, self.lcache, verbose=self.verbose)
-        return self.lcache.get_many(smiles)
+        self.ligand_featurizer.ensure_cached(smiles, verbose=self.verbose)
+        return self.ligand_featurizer.vectors_dict(smiles)
 
     def predict_aligned(
         self,

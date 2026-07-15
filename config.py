@@ -18,6 +18,9 @@ DATA_DIR: Final[str] = os.path.join(PROJECT_ROOT, "data")
 TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "BindingDB_all_prepared.csv")
 PAPYRUS_PP_TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "Papyrus_pp_prepared.csv")
 PAPYRUS_FULL_TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "Papyrus_full_prepared.csv")
+PAPYRUS_FULL_BINARY_TRAIN_CSV: Final[str] = os.path.join(
+    DATA_DIR, "train", "Papyrus_full_binary_prepared.csv"
+)
 CACHE_DIR: Final[str] = os.path.join(PROJECT_ROOT, "cache")
 SPLITS_DIR: Final[str] = os.path.join(DATA_DIR, "splits")
 MODELS_DIR: Final[str] = os.path.join(PROJECT_ROOT, "models")
@@ -40,11 +43,31 @@ TRUST_REMOTE_CODE_MODELS: Final[tuple[str, ...]] = (
     "ibm/MoLFormer-XL-both-10pct",
 )
 
+# --- Ligand representation tokens --------------------------------------------
+# Reserved tokens for ``--ligand-model`` (comma-separated combinations allowed).
+# ``molformer`` aliases ``DEFAULT_LIGAND_MODEL``; any other token is treated as a
+# Hugging Face SMILES transformer id (or rejected if unrecognized).
+LIGAND_REPR_TOKENS: Final[tuple[str, ...]] = (
+    "morgan",
+    "avalon",
+    "descriptors",
+    "molformer",
+)
+MORGAN_RADIUS: Final[int] = 2
+MORGAN_N_BITS: Final[int] = 2048
+AVALON_N_BITS: Final[int] = 512
+
 # --- Feature layout ----------------------------------------------------------
 
 # One-hot column order for the assay type. This order is fixed so that saved
-# models remain compatible across runs.
-ASSAY_TYPES: Final[tuple[str, ...]] = ("IC50", "EC50", "Ki", "Kd")
+# models remain compatible across runs. ``Other`` covers Papyrus ``type_other``
+# (and class-labeled binary rows written under that assay column).
+ASSAY_TYPES: Final[tuple[str, ...]] = ("IC50", "EC50", "Ki", "Kd", "Other")
+
+# Sentinel activity (nM) used when Papyrus ``Activity_class`` rows have no
+# quantitative potency. 1 mM is inactive at the default 50 nM cutoff.
+BINARY_INACTIVE_NM: Final[float] = 1_000_000.0
+BINARY_ACTIVE_NM: Final[float] = 1.0
 
 # Scalar auxiliary features appended after the assay one-hot block.
 DEFAULT_PH: Final[float] = 7.4
