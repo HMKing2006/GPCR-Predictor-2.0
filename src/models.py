@@ -29,7 +29,7 @@ from torch import nn
 import config
 from src.embeddings import select_device
 from src.metrics import auroc
-from src.splits import cold_protein_split
+from src.splits import cold_protein_split, double_cold_split
 
 _PREDICT_CHUNK: int = 100_000
 
@@ -219,11 +219,12 @@ class RandomForestModel(BaseRegressor):
 class _MLP(nn.Module):
     """Feed-forward network over pooled features with an optional bilinear head.
 
-    The input row is laid out as ``[protein | ligand | assay_onehot | pH | temp]``.
-    When bilinear mode is enabled, the protein and ligand slices are projected to
-    a shared width, mixed through ``nn.Bilinear``, and the resulting interaction
-    vector is concatenated back onto the original feature row before the MLP
-    trunk.
+    The input row is laid out as ``[protein | ligand]`` by default, or
+    ``[protein | ligand | assay_onehot | pH | temp]`` when assay context is
+    enabled. When bilinear mode is enabled, the protein and ligand slices are
+    projected to a shared width, mixed through ``nn.Bilinear``, and the
+    resulting interaction vector is concatenated back onto the original feature
+    row before the MLP trunk.
     """
 
     def __init__(
@@ -454,16 +455,18 @@ class MLPModel(BaseRegressor):
         y: np.ndarray,
         verbose: bool = True,
         groups: Optional[np.ndarray] = None,
+        scaffold_groups: Optional[np.ndarray] = None,
     ) -> "MLPModel":
         """Train the MLP with minibatch Adam and validation early stopping.
 
-        When ``patience > 0``, a cold-protein holdout of about
-        ``es_val_fraction`` of the rows is carved from ``groups`` so no protein
-        appears in both the fit set and the early-stopping set. After each epoch
-        the holdout AUROC is measured; the best-performing weights are cached
-        and restored at the end, and training stops early once AUROC fails to
-        improve by ``es_min_delta`` for ``patience`` consecutive epochs. Early
-        stopping is skipped when ``patience`` is ``0``.
+        When ``patience > 0``, a holdout of about ``es_val_fraction`` of the
+        rows is carved so no protein (and, when ``scaffold_groups`` is provided,
+        no Murcko scaffold) appears in both the fit set and the early-stopping
+        set. After each epoch the holdout AUROC is measured; the best-performing
+        weights are cached and restored at the end, and training stops early
+        once AUROC fails to improve by ``es_min_delta`` for ``patience``
+        consecutive epochs. Early stopping is skipped when ``patience`` is
+        ``0``.
 
         Args:
             X: Feature matrix ``(n, d)`` (may be a memmap).
@@ -471,6 +474,9 @@ class MLPModel(BaseRegressor):
             verbose: If ``True``, print periodic batch and per-epoch loss.
             groups: Per-row protein group ids aligned with ``X`` / ``y``.
                 Required when early stopping is enabled.
+            scaffold_groups: Optional per-row Murcko scaffold ids aligned with
+                ``X`` / ``y``. When provided with ``groups``, the early-stopping
+                holdout is double-cold (protein and scaffold disjoint).
 
         Returns:
             ``self``.
@@ -489,21 +495,31 @@ class MLPModel(BaseRegressor):
         if self.patience > 0:
             if groups is None:
                 raise ValueError(
-                    "MLP early stopping requires protein groups for a cold-protein holdout."
+                    "MLP early stopping requires protein groups for a cold holdout."
                 )
             groups_arr = np.asarray(groups)
             if groups_arr.shape[0] != n:
                 raise ValueError(
                     f"groups length {groups_arr.shape[0]} does not match X rows {n}."
                 )
-            es_split = cold_protein_split(
-                groups_arr,
-                {
-                    "train": 1.0 - self.es_val_fraction,
-                    "es_val": self.es_val_fraction,
-                },
-                seed=self.seed,
-            )
+            fractions = {
+                "train": 1.0 - self.es_val_fraction,
+                "es_val": self.es_val_fraction,
+            }
+            if scaffold_groups is not None:
+                scaffold_arr = np.asarray(scaffold_groups)
+                if scaffold_arr.shape[0] != n:
+                    raise ValueError(
+                        f"scaffold_groups length {scaffold_arr.shape[0]} "
+                        f"does not match X rows {n}."
+                    )
+                es_split = double_cold_split(
+                    groups_arr, scaffold_arr, fractions, seed=self.seed
+                )
+                es_kind = "double-cold"
+            else:
+                es_split = cold_protein_split(groups_arr, fractions, seed=self.seed)
+                es_kind = "cold-protein"
             train_rows = es_split["train"]
             val_rows = es_split["es_val"]
             early_stopping = train_rows.shape[0] > 0 and val_rows.shape[0] > 0
@@ -511,7 +527,7 @@ class MLPModel(BaseRegressor):
                 n_train_prot = int(np.unique(groups_arr[train_rows]).shape[0])
                 n_val_prot = int(np.unique(groups_arr[val_rows]).shape[0])
                 print(
-                    f"[mlp] cold-protein early-stop holdout: "
+                    f"[mlp] {es_kind} early-stop holdout: "
                     f"train={train_rows.shape[0]} rows / {n_train_prot} proteins, "
                     f"es_val={val_rows.shape[0]} rows / {n_val_prot} proteins",
                     flush=True,
@@ -524,7 +540,7 @@ class MLPModel(BaseRegressor):
         if not early_stopping and self.patience > 0:
             train_rows = np.arange(n, dtype=np.int64)
             if verbose:
-                print("[mlp] early stopping disabled (empty cold-protein holdout)", flush=True)
+                print("[mlp] early stopping disabled (empty cold holdout)", flush=True)
 
         self._standardize_stats(X, train_rows)
         self.net = _MLP(

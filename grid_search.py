@@ -1,4 +1,4 @@
-"""Search model types and hyperparameters with an 80/10/10 cold-protein split.
+"""Search model types and hyperparameters with an 80/10/10 double-cold split.
 
 Each candidate is trained on the train split and scored on the validation split,
 with metrics printed as soon as the candidate finishes. The candidate with the
@@ -108,9 +108,13 @@ def run_grid_search(args: argparse.Namespace) -> str:
         verbose=verbose,
         rebuild=args.rebuild_features,
         activity_threshold_nm=args.activity_threshold_nm,
+        include_assay_context=args.include_assay_context,
     )
-    groups = dataset.load_groups()
-    split = train_val_test_split(groups, dataset.signature, seed=args.seed, verbose=verbose)
+    protein_groups = dataset.load_groups()
+    scaffold_groups = dataset.load_scaffold_groups()
+    split = train_val_test_split(
+        protein_groups, scaffold_groups, dataset.signature, seed=args.seed, verbose=verbose
+    )
 
     grid = build_grid(args.include_rf)
     best_model: Optional[BaseRegressor] = None
@@ -183,6 +187,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Binder cutoff in nM for quantitative rows (default: 50). "
             "Papyrus Activity_class rows keep their explicit Activity Label."
+        ),
+    )
+    p.add_argument(
+        "--include-assay-context",
+        action="store_true",
+        default=config.INCLUDE_ASSAY_CONTEXT,
+        help=(
+            "Append assay type one-hot, pH, and temperature to feature rows "
+            "(off by default; protein+ligand only)."
         ),
     )
     p.add_argument(

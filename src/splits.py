@@ -1,9 +1,9 @@
-"""Cold-protein train/test/validation splitting with on-disk reuse.
+"""Double-cold and cold-protein train/test/validation splitting with on-disk reuse.
 
-A *cold protein* split guarantees that no protein appearing in the training set
-also appears in the evaluation sets, giving an honest estimate of generalization
-to unseen targets. Proteins (identified by the per-row group id) are shuffled and
-greedily assigned to splits until each split reaches its target *row* fraction.
+A *double-cold* split guarantees that train/val/test share neither proteins nor
+Murcko scaffolds: rows are partitioned by connected components of the
+protein–scaffold co-occurrence graph. A *cold protein* split (legacy helper)
+only enforces protein disjointness.
 
 Splits are cached under ``data/splits/`` keyed by the dataset signature, the
 split type and the random seed, so an identical configuration reuses the exact
@@ -13,11 +13,62 @@ same partition on subsequent runs.
 from __future__ import annotations
 
 import os
+from collections import defaultdict, deque
 from typing import Optional
 
 import numpy as np
 
 import config
+
+
+def _assign_blocks_to_splits(
+    block_ids: np.ndarray,
+    block_sizes: dict[int, int],
+    fractions: dict[str, float],
+    seed: int,
+) -> dict[str, np.ndarray]:
+    """Greedily assign atomic blocks to splits by target row fraction.
+
+    Args:
+        block_ids: Integer array ``(n_rows,)`` giving each row's block id.
+        block_sizes: Mapping from block id to number of rows in that block.
+        fractions: Mapping from split name to target fraction of rows. The
+            fractions should sum to 1.0; the first-listed split absorbs any
+            rounding remainder.
+        seed: Random seed controlling the block shuffle.
+
+    Returns:
+        A mapping from split name to a sorted ``int64`` array of row indices.
+    """
+    rng = np.random.default_rng(seed)
+    unique_blocks = np.asarray(sorted(block_sizes), dtype=np.int64)
+    rng.shuffle(unique_blocks)
+
+    n_rows = block_ids.shape[0]
+    names = list(fractions)
+    targets = {name: fractions[name] * n_rows for name in names}
+    assigned_rows = {name: 0 for name in names}
+    block_to_split: dict[int, str] = {}
+
+    # Reserve the first split (usually train) as the overflow bucket.
+    primary = names[0]
+    for block in unique_blocks:
+        best_name = primary
+        best_deficit = -np.inf
+        for name in names[1:]:
+            deficit = targets[name] - assigned_rows[name]
+            if deficit > best_deficit and deficit > 0:
+                best_deficit = deficit
+                best_name = name
+        bid = int(block)
+        block_to_split[bid] = best_name
+        assigned_rows[best_name] += block_sizes[bid]
+
+    indices: dict[str, list[int]] = {name: [] for name in names}
+    for row_idx, block in enumerate(block_ids):
+        indices[block_to_split[int(block)]].append(row_idx)
+
+    return {name: np.asarray(sorted(idx), dtype=np.int64) for name, idx in indices.items()}
 
 
 def cold_protein_split(
@@ -38,40 +89,88 @@ def cold_protein_split(
         A mapping from split name to a sorted ``int64`` array of row indices.
         Every protein's rows land entirely within a single split.
     """
-    rng = np.random.default_rng(seed)
     unique_groups, group_counts = np.unique(groups, return_counts=True)
     count_by_group = {int(g): int(c) for g, c in zip(unique_groups, group_counts)}
-    unique_groups = unique_groups.copy()
-    rng.shuffle(unique_groups)
+    return _assign_blocks_to_splits(
+        np.asarray(groups, dtype=np.int64),
+        count_by_group,
+        fractions,
+        seed,
+    )
 
-    n_rows = groups.shape[0]
 
-    names = list(fractions)
-    targets = {name: fractions[name] * n_rows for name in names}
-    assigned_rows = {name: 0 for name in names}
-    group_to_split: dict[int, str] = {}
+def double_cold_split(
+    protein_groups: np.ndarray,
+    scaffold_groups: np.ndarray,
+    fractions: dict[str, float],
+    seed: int = config.RANDOM_SEED,
+) -> dict[str, np.ndarray]:
+    """Partition rows so splits share neither proteins nor scaffolds.
 
-    # Reserve the first split (usually train) as the overflow bucket.
-    primary = names[0]
-    for g in unique_groups:
-        # Choose the split furthest below its row target (excluding the primary
-        # unless everything else is already satisfied).
-        best_name = primary
-        best_deficit = -np.inf
-        for name in names[1:]:
-            deficit = targets[name] - assigned_rows[name]
-            if deficit > best_deficit and deficit > 0:
-                best_deficit = deficit
-                best_name = name
-        gid = int(g)
-        group_to_split[gid] = best_name
-        assigned_rows[best_name] += count_by_group[gid]
+    Builds the undirected bipartite co-occurrence graph of proteins and
+    scaffolds, takes connected components as atomic blocks, then greedily
+    assigns blocks to splits by row count.
 
-    indices: dict[str, list[int]] = {name: [] for name in names}
-    for row_idx, g in enumerate(groups):
-        indices[group_to_split[int(g)]].append(row_idx)
+    Args:
+        protein_groups: Integer array ``(n_rows,)`` of protein group ids.
+        scaffold_groups: Integer array ``(n_rows,)`` of Murcko scaffold ids.
+        fractions: Mapping from split name to target fraction of rows.
+        seed: Random seed controlling the component shuffle.
 
-    return {name: np.asarray(sorted(idx), dtype=np.int64) for name, idx in indices.items()}
+    Returns:
+        A mapping from split name to a sorted ``int64`` array of row indices.
+
+    Raises:
+        ValueError: If the group arrays differ in length.
+    """
+    protein_groups = np.asarray(protein_groups)
+    scaffold_groups = np.asarray(scaffold_groups)
+    if protein_groups.shape[0] != scaffold_groups.shape[0]:
+        raise ValueError(
+            f"protein_groups length {protein_groups.shape[0]} does not match "
+            f"scaffold_groups length {scaffold_groups.shape[0]}."
+        )
+
+    # Bipartite adjacency: protein nodes keyed as ("p", id), scaffolds as ("s", id).
+    neighbors: dict[tuple[str, int], set[tuple[str, int]]] = defaultdict(set)
+    for prot, scaff in zip(protein_groups.tolist(), scaffold_groups.tolist()):
+        p_node = ("p", int(prot))
+        s_node = ("s", int(scaff))
+        neighbors[p_node].add(s_node)
+        neighbors[s_node].add(p_node)
+
+    # Connected components over the bipartite graph.
+    visited: set[tuple[str, int]] = set()
+    node_to_component: dict[tuple[str, int], int] = {}
+    component_id = 0
+    for start in list(neighbors):
+        if start in visited:
+            continue
+        queue: deque[tuple[str, int]] = deque([start])
+        visited.add(start)
+        while queue:
+            node = queue.popleft()
+            node_to_component[node] = component_id
+            for nxt in neighbors[node]:
+                if nxt not in visited:
+                    visited.add(nxt)
+                    queue.append(nxt)
+        component_id += 1
+
+    # Map each row to its component; isolated nodes still get a component via
+    # the protein/scaffold id even if somehow missing from neighbors (should not
+    # happen for observed pairs).
+    n_rows = protein_groups.shape[0]
+    block_ids = np.empty(n_rows, dtype=np.int64)
+    block_sizes: dict[int, int] = defaultdict(int)
+    for i, (prot, scaff) in enumerate(
+        zip(protein_groups.tolist(), scaffold_groups.tolist())
+    ):
+        cid = node_to_component[("p", int(prot))]
+        block_ids[i] = cid
+        block_sizes[cid] += 1
+
+    return _assign_blocks_to_splits(block_ids, dict(block_sizes), fractions, seed)
 
 
 def _split_path(signature: str, split_type: str, seed: int, splits_dir: str) -> str:
@@ -138,6 +237,45 @@ def load_split(
         return {name: data[name] for name in data.files}
 
 
+def get_or_create_double_cold_split(
+    protein_groups: np.ndarray,
+    scaffold_groups: np.ndarray,
+    fractions: dict[str, float],
+    signature: str,
+    split_type: str,
+    seed: int = config.RANDOM_SEED,
+    splits_dir: str = config.SPLITS_DIR,
+    verbose: bool = True,
+) -> dict[str, np.ndarray]:
+    """Return a saved double-cold split or create, save and return a new one.
+
+    Args:
+        protein_groups: Per-row protein group ids.
+        scaffold_groups: Per-row Murcko scaffold group ids.
+        fractions: Target row fractions per split.
+        signature: Dataset signature.
+        split_type: Human-readable split label.
+        seed: Random seed.
+        splits_dir: Directory for split files.
+        verbose: If ``True``, print whether the split was reused or created.
+
+    Returns:
+        The split mapping from name to row-index array.
+    """
+    existing = load_split(signature, split_type, seed, splits_dir)
+    if existing is not None:
+        if verbose:
+            sizes = ", ".join(f"{k}={len(v)}" for k, v in existing.items())
+            print(f"[split] reusing {split_type} ({sizes})")
+        return existing
+    split = double_cold_split(protein_groups, scaffold_groups, fractions, seed)
+    save_split(split, signature, split_type, seed, splits_dir)
+    if verbose:
+        sizes = ", ".join(f"{k}={len(v)}" for k, v in split.items())
+        print(f"[split] created {split_type} ({sizes})")
+    return split
+
+
 def get_or_create_split(
     groups: np.ndarray,
     fractions: dict[str, float],
@@ -147,7 +285,7 @@ def get_or_create_split(
     splits_dir: str = config.SPLITS_DIR,
     verbose: bool = True,
 ) -> dict[str, np.ndarray]:
-    """Return a saved split or create, save and return a new one.
+    """Return a saved cold-protein split or create, save and return a new one.
 
     Args:
         groups: Per-row protein group ids.
@@ -176,17 +314,19 @@ def get_or_create_split(
 
 
 def train_test_split(
-    groups: np.ndarray,
+    protein_groups: np.ndarray,
+    scaffold_groups: np.ndarray,
     signature: str,
     test_fraction: float = config.TEST_FRACTION,
     seed: int = config.RANDOM_SEED,
     splits_dir: str = config.SPLITS_DIR,
     verbose: bool = True,
 ) -> dict[str, np.ndarray]:
-    """Create/reuse an 80-20 cold-protein train/test split.
+    """Create/reuse an 80-20 double-cold train/test split.
 
     Args:
-        groups: Per-row protein group ids.
+        protein_groups: Per-row protein group ids.
+        scaffold_groups: Per-row Murcko scaffold group ids.
         signature: Dataset signature.
         test_fraction: Fraction of rows for the test set.
         seed: Random seed.
@@ -197,13 +337,21 @@ def train_test_split(
         A mapping with keys ``"train"`` and ``"test"``.
     """
     fractions = {"train": 1.0 - test_fraction, "test": test_fraction}
-    return get_or_create_split(
-        groups, fractions, signature, "train_test", seed, splits_dir, verbose
+    return get_or_create_double_cold_split(
+        protein_groups,
+        scaffold_groups,
+        fractions,
+        signature,
+        "double_cold_train_test",
+        seed,
+        splits_dir,
+        verbose,
     )
 
 
 def train_val_test_split(
-    groups: np.ndarray,
+    protein_groups: np.ndarray,
+    scaffold_groups: np.ndarray,
     signature: str,
     val_fraction: float = config.GRID_VAL_FRACTION,
     test_fraction: float = config.GRID_TEST_FRACTION,
@@ -211,10 +359,11 @@ def train_val_test_split(
     splits_dir: str = config.SPLITS_DIR,
     verbose: bool = True,
 ) -> dict[str, np.ndarray]:
-    """Create/reuse an 80-10-10 cold-protein train/val/test split.
+    """Create/reuse an 80-10-10 double-cold train/val/test split.
 
     Args:
-        groups: Per-row protein group ids.
+        protein_groups: Per-row protein group ids.
+        scaffold_groups: Per-row Murcko scaffold group ids.
         signature: Dataset signature.
         val_fraction: Fraction of rows for validation.
         test_fraction: Fraction of rows for testing.
@@ -230,6 +379,13 @@ def train_val_test_split(
         "val": val_fraction,
         "test": test_fraction,
     }
-    return get_or_create_split(
-        groups, fractions, signature, "train_val_test", seed, splits_dir, verbose
+    return get_or_create_double_cold_split(
+        protein_groups,
+        scaffold_groups,
+        fractions,
+        signature,
+        "double_cold_train_val_test",
+        seed,
+        splits_dir,
+        verbose,
     )

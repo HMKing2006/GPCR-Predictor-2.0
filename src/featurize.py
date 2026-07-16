@@ -3,15 +3,16 @@
 Feature construction runs in two streaming passes over the prepared rows:
 
 1. Index the distinct ligands and proteins and record compact per-row integer
-   references plus the scalar fields (assay type, pH, temperature, label).
+   references plus the scalar fields (assay type, pH, temperature, label) and
+   Murcko scaffold ids.
 2. Ensure every distinct entity is embedded (cache-aware), then fill an on-disk
    ``float32`` memmap ``X`` of shape ``(n_rows, feature_dim)`` in row chunks so
    peak RAM stays bounded even for tens of millions of rows.
 
 Built datasets are keyed by a signature over the source CSV, row limit, protein
-model, and the canonical ligand-representation spec, so repeated
-``train.py``/``grid_search.py`` invocations reuse the same matrix instead of
-recomputing it.
+model, the canonical ligand-representation spec, activity threshold, and whether
+assay context is included, so repeated ``train.py``/``grid_search.py``
+invocations reuse the same matrix instead of recomputing it.
 """
 
 from __future__ import annotations
@@ -23,6 +24,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+from rdkit import Chem
+from rdkit.Chem.Scaffolds import MurckoScaffold
 
 import config
 from src.data_prep import binarize_pactivity, iter_prepared_rows
@@ -35,13 +38,38 @@ _ROW_CHUNK: int = 50_000
 _PROGRESS_EVERY: int = 200_000
 
 
+def murcko_scaffold_key(smiles: str, row_index: int) -> str:
+    """Return a Bemis–Murcko scaffold key for a ligand SMILES.
+
+    Failed or empty scaffolds fall back to a unique per-row key so orphans are
+    never merged into a shared scaffold group.
+
+    Args:
+        smiles: Canonical ligand SMILES.
+        row_index: Zero-based row index used for the orphan fallback key.
+
+    Returns:
+        Scaffold SMILES, or ``"__orphan_{row_index}"`` when scaffolding fails.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return f"__orphan_{row_index}"
+    try:
+        scaffold = MurckoScaffold.MurckoScaffoldSmiles(mol=mol)
+    except Exception:
+        return f"__orphan_{row_index}"
+    if not scaffold:
+        return f"__orphan_{row_index}"
+    return scaffold
+
+
 @dataclass(frozen=True, slots=True)
 class FeatureDataset:
     """Handles to an on-disk feature matrix and its metadata.
 
     Attributes:
-        directory: Folder holding ``X.dat``, ``y.npy``, ``groups.npy`` and
-            ``meta.json``.
+        directory: Folder holding ``X.dat``, ``y.npy``, ``groups.npy``,
+            ``scaffold_groups.npy`` and ``meta.json``.
         n_rows: Number of training examples.
         n_features: Feature-vector length.
         protein_dim: Protein embedding dimensionality.
@@ -51,6 +79,8 @@ class FeatureDataset:
             binder labels and should not be re-binarized at train time.
         activity_threshold_nm: Activity cutoff in nM used when binarizing
             quantitative rows during feature construction.
+        include_assay_context: If ``True``, feature rows include assay one-hot
+            and pH/temp scalars after the ligand block.
     """
 
     directory: str
@@ -61,6 +91,7 @@ class FeatureDataset:
     signature: str
     labels_are_binary: bool = False
     activity_threshold_nm: float = config.ACTIVITY_THRESHOLD_NM
+    include_assay_context: bool = config.INCLUDE_ASSAY_CONTEXT
 
     @property
     def x_path(self) -> str:
@@ -99,6 +130,23 @@ class FeatureDataset:
             An ``int32`` array of shape ``(n_rows,)``.
         """
         return np.load(os.path.join(self.directory, "groups.npy"))
+
+    def load_scaffold_groups(self) -> np.ndarray:
+        """Load the per-row Murcko scaffold group ids.
+
+        Returns:
+            An ``int32`` array of shape ``(n_rows,)``.
+
+        Raises:
+            FileNotFoundError: If ``scaffold_groups.npy`` is missing (rebuild
+                features with the current pipeline).
+        """
+        path = os.path.join(self.directory, "scaffold_groups.npy")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Missing {path}; rebuild features to enable double-cold splits."
+            )
+        return np.load(path)
 
 
 def subset_to_memmap(dataset: "FeatureDataset", indices: np.ndarray, out_path: str) -> np.memmap:
@@ -150,6 +198,7 @@ def assemble_matrix(
     assay_indices: np.ndarray,
     ph: np.ndarray,
     temp: np.ndarray,
+    include_assay_context: bool = config.INCLUDE_ASSAY_CONTEXT,
 ) -> np.ndarray:
     """Concatenate component features into a dense matrix.
 
@@ -159,19 +208,28 @@ def assemble_matrix(
         assay_indices: Integer array ``(n,)`` of assay-type indices.
         ph: Array ``(n,)`` of pH values.
         temp: Array ``(n,)`` of temperatures in Celsius.
+        include_assay_context: If ``True``, append assay one-hot and pH/temp;
+            if ``False``, return ``[protein | ligand]`` only.
 
     Returns:
-        A ``float32`` matrix ``(n, feature_dim)`` laid out as
-        ``[protein | ligand | assay_onehot | pH | temp]``.
+        A ``float32`` matrix ``(n, feature_dim)``. With assay context the layout
+        is ``[protein | ligand | assay_onehot | pH | temp]``; otherwise
+        ``[protein | ligand]``.
     """
     n = protein_vecs.shape[0]
-    n_assay = len(config.ASSAY_TYPES)
-    out = np.empty(
-        (n, protein_vecs.shape[1] + ligand_vecs.shape[1] + n_assay + config.NUM_SCALAR_FEATURES),
-        dtype=np.float32,
-    )
     p = protein_vecs.shape[1]
     l = p + ligand_vecs.shape[1]
+    if not include_assay_context:
+        out = np.empty((n, l), dtype=np.float32)
+        out[:, :p] = protein_vecs
+        out[:, p:l] = ligand_vecs
+        return out
+
+    n_assay = len(config.ASSAY_TYPES)
+    out = np.empty(
+        (n, l + n_assay + config.NUM_SCALAR_FEATURES),
+        dtype=np.float32,
+    )
     out[:, :p] = protein_vecs
     out[:, p:l] = ligand_vecs
     onehot = np.zeros((n, n_assay), dtype=np.float32)
@@ -188,6 +246,7 @@ def _signature(
     protein_model: str,
     ligand_model: str,
     activity_threshold_nm: float,
+    include_assay_context: bool,
 ) -> str:
     """Compute a stable content signature for a dataset build.
 
@@ -197,6 +256,7 @@ def _signature(
         protein_model: Protein model identifier.
         ligand_model: Ligand representation spec (canonicalized before hashing).
         activity_threshold_nm: Binder cutoff in nM for quantitative rows.
+        include_assay_context: Whether assay/pH/temp features are included.
 
     Returns:
         A short hex digest identifying this configuration.
@@ -204,7 +264,7 @@ def _signature(
     ligand_key = canonical_ligand_repr(ligand_model)
     key = (
         f"{os.path.basename(csv_path)}|{limit}|{protein_model}|{ligand_key}|"
-        f"{activity_threshold_nm:g}"
+        f"{activity_threshold_nm:g}|assayctx={int(include_assay_context)}"
     )
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
@@ -250,6 +310,7 @@ def build_features(
     rebuild: bool = False,
     device: object = None,
     activity_threshold_nm: float = config.ACTIVITY_THRESHOLD_NM,
+    include_assay_context: bool = config.INCLUDE_ASSAY_CONTEXT,
 ) -> FeatureDataset:
     """Build (or reuse) the memmapped feature matrix for a dataset.
 
@@ -264,11 +325,20 @@ def build_features(
         device: Optional torch device for the embedders.
         activity_threshold_nm: Binder cutoff in nM for quantitative rows without
             an explicit ``Activity Label``.
+        include_assay_context: If ``True``, append assay one-hot and pH/temp to
+            each feature row; if ``False``, use protein and ligand only.
 
     Returns:
         A :class:`FeatureDataset` describing the on-disk matrix.
     """
-    signature = _signature(csv_path, limit, protein_model, ligand_model, activity_threshold_nm)
+    signature = _signature(
+        csv_path,
+        limit,
+        protein_model,
+        ligand_model,
+        activity_threshold_nm,
+        include_assay_context,
+    )
     directory = os.path.join(config.FEATURES_DIR, signature)
     meta_path = os.path.join(directory, "meta.json")
     if os.path.exists(meta_path) and not rebuild:
@@ -287,6 +357,9 @@ def build_features(
             activity_threshold_nm=float(
                 meta.get("activity_threshold_nm", config.ACTIVITY_THRESHOLD_NM)
             ),
+            include_assay_context=bool(
+                meta.get("include_assay_context", config.INCLUDE_ASSAY_CONTEXT)
+            ),
         )
 
     os.makedirs(directory, exist_ok=True)
@@ -294,8 +367,10 @@ def build_features(
     # Pass 1: index entities and record compact per-row references.
     ligand_index: dict[str, int] = {}
     protein_index: dict[str, int] = {}
+    scaffold_index: dict[str, int] = {}
     lig_ids: list[int] = []
     prot_ids: list[int] = []
+    scaffold_ids: list[int] = []
     assay_ids: list[int] = []
     phs: list[float] = []
     temps: list[float] = []
@@ -303,8 +378,11 @@ def build_features(
     if verbose:
         print("[features] pass 1: streaming + indexing rows", flush=True)
     for kept, row in enumerate(iter_prepared_rows(csv_path, limit=limit), start=1):
+        row_idx = kept - 1
         lig_ids.append(ligand_index.setdefault(row.smiles, len(ligand_index)))
         prot_ids.append(protein_index.setdefault(row.sequence, len(protein_index)))
+        scaffold_key = murcko_scaffold_key(row.smiles, row_idx)
+        scaffold_ids.append(scaffold_index.setdefault(scaffold_key, len(scaffold_index)))
         assay_ids.append(_ASSAY_TO_INDEX[row.assay_type])
         phs.append(row.ph)
         temps.append(row.temp)
@@ -322,7 +400,8 @@ def build_features(
         if verbose and kept % _PROGRESS_EVERY == 0:
             print(
                 f"[features] pass 1: {kept} rows kept "
-                f"({len(protein_index)} proteins, {len(ligand_index)} ligands so far)",
+                f"({len(protein_index)} proteins, {len(ligand_index)} ligands, "
+                f"{len(scaffold_index)} scaffolds so far)",
                 flush=True,
             )
 
@@ -332,10 +411,14 @@ def build_features(
     ligands = list(ligand_index)
     proteins = list(protein_index)
     if verbose:
-        print(f"[features] {n_rows} rows, {len(proteins)} proteins, {len(ligands)} ligands")
+        print(
+            f"[features] {n_rows} rows, {len(proteins)} proteins, "
+            f"{len(ligands)} ligands, {len(scaffold_index)} scaffolds"
+        )
 
     lig_ids_arr = np.asarray(lig_ids, dtype=np.int64)
     prot_ids_arr = np.asarray(prot_ids, dtype=np.int64)
+    scaffold_ids_arr = np.asarray(scaffold_ids, dtype=np.int32)
     assay_arr = np.asarray(assay_ids, dtype=np.int64)
     ph_arr = np.asarray(phs, dtype=np.float32)
     temp_arr = np.asarray(temps, dtype=np.float32)
@@ -369,11 +452,14 @@ def build_features(
     )
 
     # Pass 2: fill the feature memmap in row chunks.
-    n_features = config.feature_dim(protein_dim, ligand_dim)
+    n_features = config.feature_dim(
+        protein_dim, ligand_dim, include_assay_context=include_assay_context
+    )
     x_path = os.path.join(directory, "X.dat")
     X = np.memmap(x_path, dtype=np.float32, mode="w+", shape=(n_rows, n_features))
     if verbose:
-        print(f"[features] pass 2: writing {n_rows}x{n_features} matrix to {x_path}")
+        ctx = "with assay context" if include_assay_context else "protein+ligand only"
+        print(f"[features] pass 2: writing {n_rows}x{n_features} matrix ({ctx}) to {x_path}")
     for start in range(0, n_rows, _ROW_CHUNK):
         end = min(start + _ROW_CHUNK, n_rows)
         prot_vecs = protein_matrix[prot_ids_arr[start:end]]
@@ -384,15 +470,17 @@ def build_features(
             assay_arr[start:end],
             ph_arr[start:end],
             temp_arr[start:end],
+            include_assay_context=include_assay_context,
         )
         if verbose and (start // _ROW_CHUNK) % 10 == 0:
             print(f"[features] {end}/{n_rows} rows written", flush=True)
     X.flush()
     del X
 
-    # Persist labels, groups (protein ids) and metadata.
+    # Persist labels, protein/scaffold groups and metadata.
     np.save(os.path.join(directory, "y.npy"), y_arr)
     np.save(os.path.join(directory, "groups.npy"), prot_ids_arr.astype(np.int32))
+    np.save(os.path.join(directory, "scaffold_groups.npy"), scaffold_ids_arr)
     meta = {
         "n_rows": n_rows,
         "n_features": n_features,
@@ -403,7 +491,9 @@ def build_features(
         "ligand_component_dims": ligand_featurizer.component_dims,
         "labels_are_binary": True,
         "activity_threshold_nm": activity_threshold_nm,
+        "include_assay_context": include_assay_context,
         "assay_types": list(config.ASSAY_TYPES),
+        "n_scaffolds": len(scaffold_index),
     }
     with open(meta_path, "w") as handle:
         json.dump(meta, handle, indent=2)
@@ -419,4 +509,5 @@ def build_features(
         signature=signature,
         labels_are_binary=True,
         activity_threshold_nm=activity_threshold_nm,
+        include_assay_context=include_assay_context,
     )

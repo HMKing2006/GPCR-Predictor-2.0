@@ -1,9 +1,10 @@
 """Train a single 50 nM binder / non-binder classifier.
 
-Builds (or reuses) the cached feature matrix, applies an 80/20 cold-protein
-split, trains the requested model (random forest by default, or an MLP), prints
-classification metrics on the held-out test set, and saves the model as a
-joblib file. The core routines are imported by ``grid_search.py``.
+Builds (or reuses) the cached feature matrix, applies an 80/20 double-cold
+(protein + Murcko scaffold) split, trains the requested model (random forest by
+default, or an MLP), prints classification metrics on the held-out test set, and
+saves the model as a joblib file. The core routines are imported by
+``grid_search.py``.
 """
 
 from __future__ import annotations
@@ -111,6 +112,7 @@ def fit_on_indices(
         "model_type": model_type,
         "hyperparams": hyperparams,
         "activity_threshold_nm": dataset.activity_threshold_nm,
+        "include_assay_context": dataset.include_assay_context,
         "task": "classification",
     }
     if verbose:
@@ -121,8 +123,9 @@ def fit_on_indices(
         )
     fit_kwargs: dict[str, Any] = {"verbose": verbose}
     if model_type == "mlp":
-        # Align protein ids with the materialized train memmap for cold-protein ES.
+        # Align protein/scaffold ids with the materialized train memmap for ES.
         fit_kwargs["groups"] = dataset.load_groups()[train_idx]
+        fit_kwargs["scaffold_groups"] = dataset.load_scaffold_groups()[train_idx]
     model.fit(X_train, y_train, **fit_kwargs)
     del X_train
     return model
@@ -186,10 +189,17 @@ def run_training(args: argparse.Namespace) -> str:
         verbose=verbose,
         rebuild=args.rebuild_features,
         activity_threshold_nm=args.activity_threshold_nm,
+        include_assay_context=args.include_assay_context,
     )
-    groups = dataset.load_groups()
+    protein_groups = dataset.load_groups()
+    scaffold_groups = dataset.load_scaffold_groups()
     split = train_test_split(
-        groups, dataset.signature, test_fraction=args.test_fraction, seed=args.seed, verbose=verbose
+        protein_groups,
+        scaffold_groups,
+        dataset.signature,
+        test_fraction=args.test_fraction,
+        seed=args.seed,
+        verbose=verbose,
     )
 
     hyperparams = collect_hyperparams(args, args.model)
@@ -246,6 +256,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Papyrus Activity_class rows keep their explicit Activity Label."
         ),
     )
+    p.add_argument(
+        "--include-assay-context",
+        action="store_true",
+        default=config.INCLUDE_ASSAY_CONTEXT,
+        help=(
+            "Append assay type one-hot, pH, and temperature to feature rows "
+            "(off by default; protein+ligand only)."
+        ),
+    )
     p.add_argument("--quiet", action="store_true", help="Reduce progress output.")
 
     # Random-forest hyperparameters.
@@ -274,7 +293,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--es-val-fraction",
         type=float,
         default=float(config.MLP_DEFAULTS["es_val_fraction"]),
-        help="Target fraction of training rows for the cold-protein MLP ES holdout.",
+        help="Target fraction of training rows for the double-cold MLP ES holdout.",
     )
     p.add_argument(
         "--batchnorm",

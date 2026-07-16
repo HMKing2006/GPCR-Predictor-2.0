@@ -77,6 +77,9 @@ class Predictor:
         self.model = load_model(model_path)
         self.protein_model: str = self.model.metadata["protein_model"]
         self.ligand_model: str = self.model.metadata["ligand_model"]
+        self.include_assay_context: bool = bool(
+            self.model.metadata.get("include_assay_context", True)
+        )
         self.pemb = protein_embedder(self.protein_model)
         self.pcache = EmbeddingCache("protein", self.protein_model)
         self.ligand_featurizer: CompositeLigandFeaturizer = parse_ligand_repr(self.ligand_model)
@@ -157,7 +160,14 @@ class Predictor:
             assay_idx = np.array([_ASSAY_INDEX[assays[i]] for i in rows], dtype=np.int64)
             ph_arr = np.array([ph[i] for i in rows], dtype=np.float32)
             temp_arr = np.array([temp[i] for i in rows], dtype=np.float32)
-            matrix = assemble_matrix(protein_vecs, ligand_vecs, assay_idx, ph_arr, temp_arr)
+            matrix = assemble_matrix(
+                protein_vecs,
+                ligand_vecs,
+                assay_idx,
+                ph_arr,
+                temp_arr,
+                include_assay_context=self.include_assay_context,
+            )
             out[rows] = self.model.predict(matrix)
         return out
 
@@ -214,7 +224,12 @@ class Predictor:
                 lig_vec = lvecs[canon]
                 ligand_matrix = np.repeat(lig_vec[None, :], len(seqs), axis=0)
                 matrix = assemble_matrix(
-                    protein_matrix, ligand_matrix, assay_idx_full, ph_full, temp_full
+                    protein_matrix,
+                    ligand_matrix,
+                    assay_idx_full,
+                    ph_full,
+                    temp_full,
+                    include_assay_context=self.include_assay_context,
                 )
                 preds = self.model.predict(matrix)
                 for seq, pred in zip(seqs, preds):

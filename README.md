@@ -5,8 +5,10 @@ BindingDB or Papyrus data. Ligands can be represented with MoLFormer-XL embeddin
 Morgan/Avalon fingerprints, RDKit physicochemical descriptors, or any concatenation
 of those. Proteins are embedded with ESM-2. Ligand and protein vectors are cached
 in LMDB stores named after the components that produced them. Models are trained
-with a cold-protein split and scored by classification metrics (AUROC, AUPRC,
-precision, recall, F1).
+with a **double-cold** split (held-out proteins *and* Murcko scaffolds) and scored
+by classification metrics (AUROC, AUPRC, precision, recall, F1). By default the
+feature vector is protein + ligand only (assay type, pH, and temperature are
+optional).
 
 ## Setup
 
@@ -37,7 +39,8 @@ preparation:
 - Censored values (`>` / `<`) and rows with missing SMILES/sequence/activity are
   dropped.
 - `pH` (missing imputed to 7.4) and `Temp (C)` (parsed, clipped, missing imputed
-  to 25.0 C) are used as scalar features. Assay type is one-hot encoded.
+  to 25.0 C) are available as optional scalar features when
+  `--include-assay-context` is set. Assay type is one-hot encoded in that mode.
 
 Labels are stored as binder / non-binder (50 nM cutoff,
 `config.ACTIVITY_THRESHOLD_NM`) when features are built. Rows with an optional
@@ -104,8 +107,8 @@ Useful flags:
 | `--limit N` | Cap total output rows (quant written before binary) |
 
 Train or grid-search on Papyrus by passing `--csv`. **Always use
-`--rebuild-features`** after changing assay vocabulary (the assay one-hot is
-now 5-d including `Other`) or switching prepared CSVs:
+`--rebuild-features`** after changing assay-context settings, assay vocabulary,
+or switching prepared CSVs:
 
 ```bash
 python train.py --csv data/train/Papyrus_pp_prepared.csv --rebuild-features
@@ -113,8 +116,8 @@ python grid_search.py --csv data/train/Papyrus_full_prepared.csv --rebuild-featu
 python grid_search.py --csv data/train/Papyrus_full_binary_prepared.csv --rebuild-features
 ```
 
-Each CSV gets its own feature-cache signature and cold-protein splits under
-`cache/features/` and `data/splits/`.
+Each CSV + assay-context setting gets its own feature-cache signature and
+double-cold splits under `cache/features/` and `data/splits/`.
 
 ## Ligand representations
 
@@ -150,19 +153,33 @@ MoLFormer to an existing Morgan cache reuses the Morgan store.
 
 ## Feature vector
 
+**Default** (assay context off):
+
+`concat(protein_emb, ligand_repr)`
+
+**With `--include-assay-context`:**
+
 `concat(protein_emb, ligand_repr, assay_onehot[5], pH[1], temp[1])`
 
 Assay one-hot order is fixed in `config.ASSAY_TYPES`: IC50, EC50, Ki, Kd, Other.
 
-With the default MoLFormer ligand representation this is
-`concat(protein[1280], ligand[768], assay[4], pH, temp)`. With combined
-representations, `ligand` is the concatenation of each selected component.
+With the default MoLFormer ligand representation and assay context off this is
+`concat(protein[1280], ligand[768])`. With assay context enabled it becomes
+`concat(protein[1280], ligand[768], assay[5], pH, temp)`. With combined
+fingerprints, `ligand` is the concatenation of each selected component.
+
+During feature build, Bemis–Murcko scaffold ids are also computed and stored
+(`scaffold_groups.npy`) for double-cold splitting. Empty or failed scaffolds get
+a unique per-row orphan id so they never merge incorrectly.
 
 ## Training
 
 ```bash
-# Default: BindingDB, random forest, 80/20 cold-protein split
+# Default: BindingDB, random forest, 80/20 double-cold split, protein+ligand only
 python train.py
+
+# Include assay type / pH / temperature features
+python train.py --include-assay-context --rebuild-features
 
 # Papyrus++
 python train.py --csv data/train/Papyrus_pp_prepared.csv --rebuild-features
@@ -181,8 +198,8 @@ After training, accuracy, precision, recall, F1, AUROC, and AUPRC are printed
 and the model is saved to `models/` as a joblib file. Splits are saved under
 `data/splits/` and reused automatically when the dataset and seed match.
 
-MLP early stopping uses a **cold-protein holdout** carved from the training split
-(~5% of train proteins), not a random row split.
+MLP early stopping uses a **double-cold holdout** carved from the training split
+(~5% of train rows; no protein or scaffold overlap with the fit set).
 
 ## Grid search
 
@@ -193,12 +210,15 @@ python grid_search.py
 # Papyrus++
 python grid_search.py --csv data/train/Papyrus_pp_prepared.csv --rebuild-features
 
+# Include assay context
+python grid_search.py --include-assay-context --rebuild-features
+
 # Include random-forest baselines
 python grid_search.py --include-rf
 ```
 
 Iterates over MLP hyperparameter combinations (and optionally RF baselines) using
-an 80/10/10 cold-protein split, prints each candidate's validation AUROC as it
+an 80/10/10 double-cold split, prints each candidate's validation AUROC as it
 finishes, and saves the best model to `models/`.
 
 ## Prediction
@@ -217,14 +237,17 @@ python predict.py --spreadsheet-dir ./inputs/
 # Mode 4: a folder of ligand inputs x a folder of protein inputs
 python predict.py --ligand-dir ./ligands/ --protein-dir ./proteins/
 
-# Override the assumed assay / conditions (defaults: Ki, pH 7.4, 25 C)
+# Override the assumed assay / conditions (defaults: Ki, pH 7.4, 25 C).
+# These are only used in the feature vector when the model was trained with
+# --include-assay-context; otherwise they are ignored at featurization time.
 python predict.py --spreadsheet input.csv --assay IC50 --pH 6.5 --temp 37
 ```
 
 Outputs include a `P(Active)` column: the predicted probability that activity is
 at most 50 nM (matching the training threshold). Spreadsheet outputs are named
 `*_predictions.<ext>`; pairwise/folder modes write a combined CSV. Prediction
-reloads the ligand representation from the saved model's metadata.
+reloads the ligand representation and assay-context setting from the saved
+model's metadata.
 
 ## Project layout
 
@@ -235,8 +258,8 @@ src/data_prep.py     Streaming cleaning + label preparation.
 src/lmdb_cache.py    Embedding cache with model-derived DB names.
 src/embeddings.py    ESM-2 and MoLFormer-XL embedders.
 src/ligand_repr.py   Fingerprints, descriptors, composite ligand reps.
-src/featurize.py     Memmapped feature-matrix assembly.
-src/splits.py        Cold-protein splits with save/reuse.
+src/featurize.py     Memmapped feature-matrix assembly + Murcko scaffolds.
+src/splits.py        Double-cold (protein+scaffold) splits with save/reuse.
 src/models.py        Warm-start RF + torch MLP classifiers.
 src/metrics.py       Classification metrics (AUROC, AUPRC, F1, …).
 src/io_utils.py      Spreadsheet / SMILES / SDF / FASTA IO.

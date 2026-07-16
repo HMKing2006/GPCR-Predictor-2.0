@@ -80,26 +80,40 @@ TEMP_MAX_C: Final[float] = 100.0
 # Number of trailing scalar features: pH and temperature.
 NUM_SCALAR_FEATURES: Final[int] = 2
 
+# When ``False`` (default), feature rows are ``[protein | ligand]`` only so the
+# model cannot exploit assay-type / pH / temperature shortcuts. Pass
+# ``--include-assay-context`` to append the assay one-hot and scalars.
+INCLUDE_ASSAY_CONTEXT: Final[bool] = False
 
-def feature_dim(protein_dim: int = PROTEIN_EMB_DIM, ligand_dim: int = LIGAND_EMB_DIM) -> int:
+
+def feature_dim(
+    protein_dim: int = PROTEIN_EMB_DIM,
+    ligand_dim: int = LIGAND_EMB_DIM,
+    include_assay_context: bool = INCLUDE_ASSAY_CONTEXT,
+) -> int:
     """Compute the total feature-vector length.
 
     Args:
         protein_dim: Dimensionality of the protein embedding.
         ligand_dim: Dimensionality of the ligand embedding.
+        include_assay_context: If ``True``, include assay one-hot and pH/temp
+            scalars after the ligand block.
 
     Returns:
-        The concatenated feature dimension: protein + ligand + assay one-hot +
-        the scalar auxiliary features (pH and temperature).
+        The concatenated feature dimension. With assay context this is
+        protein + ligand + assay one-hot + pH + temperature; without it,
+        protein + ligand only.
     """
-    return protein_dim + ligand_dim + len(ASSAY_TYPES) + NUM_SCALAR_FEATURES
+    if include_assay_context:
+        return protein_dim + ligand_dim + len(ASSAY_TYPES) + NUM_SCALAR_FEATURES
+    return protein_dim + ligand_dim
 
 
 # --- Classification label ----------------------------------------------------
 
 # Binders are positives: activity_nM <= this threshold (equivalently
 # pActivity >= -log10(threshold_nM * 1e-9)).
-ACTIVITY_THRESHOLD_NM: Final[float] = 50.0
+ACTIVITY_THRESHOLD_NM: Final[float] = 10000.0
 
 # --- Default hyperparameters -------------------------------------------------
 
@@ -121,12 +135,12 @@ RF_DEFAULTS: Final[dict[str, int]] = {
 
 # Torch MLP defaults.
 #
-# ``patience`` and ``es_val_fraction`` drive early stopping: a cold-protein
+# ``patience`` and ``es_val_fraction`` drive early stopping: a double-cold
 # holdout targeting ``es_val_fraction`` of the training rows is carved each
-# fit (no protein overlap with the fit set), validation AUROC is tracked after
-# every epoch, the best weights are restored, and training stops once AUROC
-# fails to improve for ``patience`` consecutive epochs. Set ``patience`` to
-# ``0`` to disable early stopping and always run ``epochs``.
+# fit (no protein or scaffold overlap with the fit set), validation AUROC is
+# tracked after every epoch, the best weights are restored, and training stops
+# once AUROC fails to improve for ``patience`` consecutive epochs. Set
+# ``patience`` to ``0`` to disable early stopping and always run ``epochs``.
 # ``use_batchnorm`` inserts BatchNorm1d after each hidden linear layer.
 # ``use_bilinear`` adds a learned protein/ligand bilinear interaction block: the
 # protein and ligand embeddings are projected to ``bilinear_dim`` and combined by
