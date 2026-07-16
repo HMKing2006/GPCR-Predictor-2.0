@@ -389,3 +389,154 @@ def train_val_test_split(
         splits_dir,
         verbose,
     )
+
+
+def year_cutoffs_from_fractions(
+    years: np.ndarray,
+    val_fraction: float,
+    test_fraction: float,
+) -> tuple[int, int]:
+    """Derive publication-year cutoffs from target row fractions.
+
+    Only rows with ``year >= 0`` participate in the fraction calculation.
+    Cutoffs snap to discrete year boundaries so actual split sizes may differ
+    slightly from the requested fractions.
+
+    Args:
+        years: Per-row years; missing values should be ``-1``.
+        val_fraction: Target fraction of *dated* rows for validation.
+        test_fraction: Target fraction of *dated* rows for testing.
+
+    Returns:
+        ``(val_year, test_year)`` such that train is ``year <= val_year``,
+        val is ``val_year < year <= test_year``, and test is ``year > test_year``.
+
+    Raises:
+        ValueError: If there are no dated rows, fractions are invalid, or
+            cutoffs cannot be resolved.
+    """
+    if val_fraction < 0.0 or test_fraction < 0.0:
+        raise ValueError("val_fraction and test_fraction must be non-negative.")
+    if val_fraction + test_fraction >= 1.0:
+        raise ValueError("val_fraction + test_fraction must be < 1.0.")
+
+    years = np.asarray(years)
+    dated = years[years >= 0]
+    if dated.size == 0:
+        raise ValueError(
+            "No dated rows available for a time split. Rebuild features from a "
+            "Papyrus Parquet file that includes Year."
+        )
+
+    unique_years, counts = np.unique(dated, return_counts=True)
+    unique_years = unique_years.astype(np.int64)
+    total = int(counts.sum())
+    cum = np.cumsum(counts)
+    train_target = (1.0 - val_fraction - test_fraction) * total
+    pre_test_target = (1.0 - test_fraction) * total
+
+    val_idx = int(np.searchsorted(cum, train_target, side="left"))
+    val_idx = min(max(val_idx, 0), unique_years.size - 1)
+    test_idx = int(np.searchsorted(cum, pre_test_target, side="left"))
+    test_idx = min(max(test_idx, val_idx), unique_years.size - 1)
+
+    val_year = int(unique_years[val_idx])
+    test_year = int(unique_years[test_idx])
+    if test_year < val_year:
+        test_year = val_year
+    return val_year, test_year
+
+
+def time_split(
+    years: np.ndarray,
+    val_year: int,
+    test_year: int,
+    *,
+    include_val: bool = True,
+) -> dict[str, np.ndarray]:
+    """Partition rows by publication year cutoffs.
+
+    Missing years (``year < 0``) are assigned to train.
+
+    Args:
+        years: Per-row years; missing values should be ``-1``.
+        val_year: Inclusive upper bound for the train window among dated rows.
+        test_year: Inclusive upper bound for the validation window.
+        include_val: If ``False``, merge the val window into train and return
+            only ``train`` / ``test`` (for ``train.py`` two-way splits).
+
+    Returns:
+        Mapping with ``train`` / ``test``, and ``val`` when ``include_val``.
+    """
+    years = np.asarray(years)
+    missing = years < 0
+    train_mask = missing | (years <= val_year)
+    val_mask = (~missing) & (years > val_year) & (years <= test_year)
+    test_mask = (~missing) & (years > test_year)
+
+    if not include_val:
+        train_mask = train_mask | val_mask
+        return {
+            "train": np.flatnonzero(train_mask).astype(np.int64),
+            "test": np.flatnonzero(test_mask).astype(np.int64),
+        }
+
+    return {
+        "train": np.flatnonzero(train_mask).astype(np.int64),
+        "val": np.flatnonzero(val_mask).astype(np.int64),
+        "test": np.flatnonzero(test_mask).astype(np.int64),
+    }
+
+
+def get_or_create_time_split(
+    years: np.ndarray,
+    signature: str,
+    val_fraction: float,
+    test_fraction: float,
+    *,
+    include_val: bool = True,
+    seed: int = config.RANDOM_SEED,
+    splits_dir: str = config.SPLITS_DIR,
+    verbose: bool = True,
+) -> dict[str, np.ndarray]:
+    """Return a cached percentage-based time split or create a new one.
+
+    Args:
+        years: Per-row years (``-1`` when missing).
+        signature: Dataset signature.
+        val_fraction: Target dated-row fraction for validation.
+        test_fraction: Target dated-row fraction for testing.
+        include_val: If ``False``, return a train/test split only.
+        seed: Unused for assignment (deterministic from years) but included in
+            the cache key for consistency with other split helpers.
+        splits_dir: Directory for split files.
+        verbose: If ``True``, print cutoff years and split sizes.
+
+    Returns:
+        The split mapping.
+    """
+    split_type = (
+        f"time_vf{val_fraction:g}_tf{test_fraction:g}"
+        + ("" if include_val else "_noval")
+    )
+    existing = load_split(signature, split_type, seed, splits_dir)
+    if existing is not None:
+        if verbose:
+            sizes = ", ".join(f"{k}={len(v)}" for k, v in existing.items())
+            print(f"[split] reusing {split_type} ({sizes})")
+        return existing
+
+    val_year, test_year = year_cutoffs_from_fractions(years, val_fraction, test_fraction)
+    split = time_split(years, val_year, test_year, include_val=include_val)
+    save_split(split, signature, split_type, seed, splits_dir)
+    if verbose:
+        n = years.shape[0]
+        missing = int(np.sum(years < 0))
+        sizes = ", ".join(
+            f"{k}={len(v)} ({100.0 * len(v) / max(n, 1):.1f}%)" for k, v in split.items()
+        )
+        print(
+            f"[split] created {split_type}: val_year={val_year} test_year={test_year} "
+            f"missing_year={missing} | {sizes}"
+        )
+    return split

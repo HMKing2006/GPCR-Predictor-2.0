@@ -16,10 +16,10 @@ from typing import Any, Final
 PROJECT_ROOT: Final[str] = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR: Final[str] = os.path.join(PROJECT_ROOT, "data")
 TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "BindingDB_all_prepared.csv")
-PAPYRUS_PP_TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "Papyrus_pp_prepared.csv")
-PAPYRUS_FULL_TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "Papyrus_full_prepared.csv")
+PAPYRUS_PP_TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "Papyrus_pp_prepared.parquet")
+PAPYRUS_FULL_TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "Papyrus_full_prepared.parquet")
 PAPYRUS_FULL_BINARY_TRAIN_CSV: Final[str] = os.path.join(
-    DATA_DIR, "train", "Papyrus_full_binary_prepared.csv"
+    DATA_DIR, "train", "Papyrus_full_binary_prepared.parquet"
 )
 CACHE_DIR: Final[str] = os.path.join(PROJECT_ROOT, "cache")
 SPLITS_DIR: Final[str] = os.path.join(DATA_DIR, "splits")

@@ -1,31 +1,31 @@
-"""Download Papyrus and write a BindingDB-compatible prepared CSV.
+"""Download Papyrus and write a BindingDB-compatible prepared Parquet file.
 
 Streams the Papyrus++ or full without_stereochemistry release, keeps exact
 quantitative Ki/Kd/IC50/EC50/Other values, joins protein sequences, and writes
-a CSV that :func:`src.data_prep.iter_prepared_rows` can consume::
+a Parquet file that :func:`src.data_prep.iter_prepared_rows` can consume::
 
     python build_papyrus.py --subset plusplus
-    python train.py --csv data/train/Papyrus_pp_prepared.csv --rebuild-features
+    python train.py --csv data/train/Papyrus_pp_prepared.parquet --rebuild-features
 
     python build_papyrus.py --subset full
-    python train.py --csv data/train/Papyrus_full_prepared.csv --rebuild-features
+    python train.py --csv data/train/Papyrus_full_prepared.parquet --rebuild-features
 
     # Quant + Papyrus Activity_class binary rows (use --limit to cap size)
     python build_papyrus.py --subset full --include-binary --limit 5000000
-    python train.py --csv data/train/Papyrus_full_binary_prepared.csv --rebuild-features
+    python train.py --csv data/train/Papyrus_full_binary_prepared.parquet --rebuild-features
 
     # Resume a failed binary build (skips quantitative pass, appends binary rows)
     python build_papyrus.py --subset full --include-binary --resume --no-download
 
-The full subset is substantially larger (multi-GB download; the prepared CSV
-may exceed 10 GB and take hours to build). Prefer ``--subset plusplus`` unless
-you specifically need the full release. Use ``--limit`` for smoke tests.
+The full subset is substantially larger (multi-GB download; the prepared
+Parquet may exceed several GB and take hours to build). Prefer
+``--subset plusplus`` unless you specifically need the full release. Use
+``--limit`` for smoke tests.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import math
 import os
 import sys
@@ -33,11 +33,13 @@ from typing import Any, Iterator, Optional
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 import config
 from src.data_prep import canonicalize_smiles
 
-# Output columns in the BindingDB prepared-CSV schema.
+# Output columns in the BindingDB prepared schema (Parquet / CSV-compatible).
 _OUTPUT_COLUMNS: list[str] = [
     "Ligand SMILES",
     "Target Name",
@@ -51,7 +53,26 @@ _OUTPUT_COLUMNS: list[str] = [
     "pH",
     "Temp (C)",
     "BindingDB Target Chain Sequence 1",
+    "Year",
 ]
+
+_PARQUET_SCHEMA = pa.schema(
+    [
+        ("Ligand SMILES", pa.string()),
+        ("Target Name", pa.string()),
+        ("Target Source Organism According to Curator or DataSource", pa.string()),
+        ("Ki (nM)", pa.string()),
+        ("IC50 (nM)", pa.string()),
+        ("Kd (nM)", pa.string()),
+        ("EC50 (nM)", pa.string()),
+        ("Other (nM)", pa.string()),
+        ("Activity Label", pa.string()),
+        ("pH", pa.string()),
+        ("Temp (C)", pa.string()),
+        ("BindingDB Target Chain Sequence 1", pa.string()),
+        ("Year", pa.int32()),
+    ]
+)
 
 # Papyrus type_* column -> BindingDB assay column. Order is the preference used
 # when more than one type flag is set on a row (rare).
@@ -313,6 +334,97 @@ def load_protein_table(
     return lookup
 
 
+def parse_year(raw: object) -> Optional[int]:
+    """Parse a Papyrus publication year cell.
+
+    Args:
+        raw: Raw Year cell value.
+
+    Returns:
+        Integer year when parseable, else ``None``.
+    """
+    if raw is None or (isinstance(raw, float) and math.isnan(raw)):
+        return None
+    text = str(raw).strip()
+    if not text or text.lower() == "nan":
+        return None
+    try:
+        year = int(float(text))
+    except (TypeError, ValueError):
+        return None
+    if year < 1900 or year > 2100:
+        return None
+    return year
+
+
+def _records_to_table(rows: list[dict[str, Any]]) -> pa.Table:
+    """Convert prepared row dictionaries to a typed Arrow table.
+
+    Args:
+        rows: Dictionaries with keys from ``_OUTPUT_COLUMNS``.
+
+    Returns:
+        A ``pyarrow.Table`` matching ``_PARQUET_SCHEMA``.
+    """
+    columns: dict[str, list[Any]] = {name: [] for name in _OUTPUT_COLUMNS}
+    for record in rows:
+        for name in _OUTPUT_COLUMNS:
+            value = record.get(name)
+            if name == "Year":
+                columns[name].append(None if value in ("", None) else int(value))
+            else:
+                columns[name].append("" if value is None else str(value))
+    arrays = []
+    for field in _PARQUET_SCHEMA:
+        if field.name == "Year":
+            arrays.append(pa.array(columns[field.name], type=pa.int32()))
+        else:
+            arrays.append(pa.array(columns[field.name], type=pa.string()))
+    return pa.Table.from_arrays(arrays, schema=_PARQUET_SCHEMA)
+
+
+def _align_table_schema(table: pa.Table) -> pa.Table:
+    """Cast / fill columns so ``table`` matches ``_PARQUET_SCHEMA``.
+
+    Args:
+        table: Source table that may be missing ``Year`` or use other types.
+
+    Returns:
+        A table with ``_PARQUET_SCHEMA``.
+    """
+    arrays = []
+    for field in _PARQUET_SCHEMA:
+        if field.name in table.column_names:
+            col = table.column(field.name)
+            arrays.append(
+                col.cast(field.type, safe=False) if col.type != field.type else col
+            )
+        else:
+            arrays.append(pa.nulls(table.num_rows, type=field.type))
+    return pa.Table.from_arrays(arrays, schema=_PARQUET_SCHEMA)
+
+
+def _copy_parquet_to_writer(source_path: str, writer: pq.ParquetWriter) -> int:
+    """Stream all row groups from an existing Parquet file into a writer.
+
+    Args:
+        source_path: Existing Parquet path.
+        writer: Open ``ParquetWriter`` receiving the copied batches.
+
+    Returns:
+        Number of rows copied.
+    """
+    copied = 0
+    pf = pq.ParquetFile(source_path)
+    for i in range(pf.num_row_groups):
+        table = pf.read_row_group(i)
+        if table.schema != _PARQUET_SCHEMA:
+            table = _align_table_schema(table)
+        writer.write_table(table)
+        copied += table.num_rows
+    return copied
+
+
 def pchembl_to_nm(pchembl: float) -> Optional[float]:
     """Convert a pChEMBL / pActivity value to activity in nM.
 
@@ -570,7 +682,7 @@ def convert_chunk(
 
     Returns:
         A tuple ``(rows, rows_written_after)`` where ``rows`` is a list of
-        dictionaries ready for ``csv.DictWriter``.
+        dictionaries ready for the Parquet writer.
     """
     out: list[dict[str, Any]] = []
     for _, row in chunk.iterrows():
@@ -615,6 +727,8 @@ def convert_chunk(
         record["Target Source Organism According to Curator or DataSource"] = protein["organism"]
         record[assay_col] = f"{activity_nm:.6g}"
         record["BindingDB Target Chain Sequence 1"] = protein["sequence"]
+        year = parse_year(row.get("Year"))
+        record["Year"] = year if year is not None else ""
         out.append(record)
         seen_ligands.add(smiles)
         seen_proteins.add(protein["sequence"])
@@ -624,23 +738,25 @@ def convert_chunk(
 
 
 def _count_existing_rows(path: str) -> tuple[int, int]:
-    """Count quantitative and binary rows in an existing prepared CSV.
+    """Count quantitative and binary rows in an existing prepared Parquet file.
 
     Quantitative rows have an empty ``Activity Label``; binary rows set it to
     ``0`` or ``1``.
 
     Args:
-        path: Path to a prepared CSV written by this script.
+        path: Path to a prepared Parquet file written by this script.
 
     Returns:
         A tuple ``(quant_rows, binary_rows)``.
     """
     quant_rows = 0
     binary_rows = 0
-    with open(path, newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            if str(row.get("Activity Label", "") or "").strip():
+    pf = pq.ParquetFile(path)
+    for i in range(pf.num_row_groups):
+        table = pf.read_row_group(i, columns=["Activity Label"])
+        labels = table.column("Activity Label").to_pylist()
+        for label in labels:
+            if str(label or "").strip():
                 binary_rows += 1
             else:
                 quant_rows += 1
@@ -707,6 +823,8 @@ def convert_binary_chunk(
         record["Other (nM)"] = f"{activity_nm:.6g}"
         record["Activity Label"] = str(label)
         record["BindingDB Target Chain Sequence 1"] = protein["sequence"]
+        year = parse_year(row.get("Year"))
+        record["Year"] = year if year is not None else ""
         out.append(record)
 
     if binary_skip > 0:
@@ -893,7 +1011,7 @@ def iter_binary_chunks(
 
 
 def run_build(args: argparse.Namespace) -> str:
-    """Download (optional), convert, and write the prepared Papyrus CSV.
+    """Download (optional), convert, and write the prepared Papyrus Parquet file.
 
     Writes quantitative assay rows first. When ``--include-binary`` is set,
     streams a second pass over ``Activity_class`` rows into the same file.
@@ -903,7 +1021,7 @@ def run_build(args: argparse.Namespace) -> str:
         args: Parsed CLI arguments.
 
     Returns:
-        Path of the written prepared CSV.
+        Path of the written prepared Parquet file.
     """
     _require_papyrus()
     verbose = not args.quiet
@@ -915,6 +1033,8 @@ def run_build(args: argparse.Namespace) -> str:
     if resume and not include_binary:
         raise SystemExit("--resume requires --include-binary.")
     output = args.output or _default_output(args.subset, include_binary=include_binary)
+    if not output.lower().endswith((".parquet", ".pq")):
+        raise SystemExit(f"Papyrus output must be a .parquet path; got {output!r}")
     os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
     if resume and not os.path.isfile(output):
         raise SystemExit(f"--resume requested but output file does not exist: {output}")
@@ -951,7 +1071,7 @@ def run_build(args: argparse.Namespace) -> str:
         quant_existing, binary_existing = _count_existing_rows(output)
         if quant_existing == 0:
             raise SystemExit(
-                "--resume requires an existing CSV with quantitative rows "
+                "--resume requires an existing Parquet file with quantitative rows "
                 "(Activity Label empty)."
             )
         rows_written = quant_existing + binary_existing
@@ -973,11 +1093,18 @@ def run_build(args: argparse.Namespace) -> str:
                 )
             return output
 
-    write_mode = "a" if resume else "w"
-    with open(output, write_mode, newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=_OUTPUT_COLUMNS, extrasaction="ignore")
-        if not resume:
-            writer.writeheader()
+    # Resume rewrites via a temp file (Parquet cannot append in place).
+    write_path = f"{output}.__building__.parquet" if resume else output
+    if resume and os.path.exists(write_path):
+        os.remove(write_path)
+
+    writer = pq.ParquetWriter(write_path, _PARQUET_SCHEMA, compression="zstd")
+    try:
+        if resume:
+            if verbose:
+                print("[papyrus] copying existing Parquet rows into rebuild file", flush=True)
+            _copy_parquet_to_writer(output, writer)
+
         if not resume:
             for chunk in iter_filtered_chunks(
                 version=resolved_version,
@@ -997,8 +1124,7 @@ def run_build(args: argparse.Namespace) -> str:
                     rows_written,
                 )
                 if rows:
-                    writer.writerows(rows)
-                    handle.flush()
+                    writer.write_table(_records_to_table(rows))
                 if args.limit is not None and rows_written >= args.limit:
                     if verbose:
                         print(
@@ -1039,8 +1165,7 @@ def run_build(args: argparse.Namespace) -> str:
                     binary_skip=binary_skip,
                 )
                 if rows:
-                    writer.writerows(rows)
-                    handle.flush()
+                    writer.write_table(_records_to_table(rows))
                 if args.limit is not None and rows_written >= args.limit:
                     if verbose:
                         print(
@@ -1048,6 +1173,11 @@ def run_build(args: argparse.Namespace) -> str:
                             flush=True,
                         )
                     break
+    finally:
+        writer.close()
+
+    if resume:
+        os.replace(write_path, output)
 
     if verbose:
         print(
@@ -1092,9 +1222,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """
     p = argparse.ArgumentParser(
         description=(
-            "Build a BindingDB-compatible prepared CSV from Papyrus++ or the "
-            "full without_stereochemistry Papyrus release. The full subset can "
-            "produce a multi-GB CSV and take hours; prefer --subset plusplus "
+            "Build a BindingDB-compatible prepared Parquet file from Papyrus++ "
+            "or the full without_stereochemistry Papyrus release. The full subset "
+            "can produce a multi-GB file and take hours; prefer --subset plusplus "
             "unless you need the full release."
         )
     )
@@ -1113,8 +1243,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--output",
         default=None,
         help=(
-            "Output CSV path (default: Papyrus_pp_prepared.csv, "
-            "Papyrus_full_prepared.csv, or Papyrus_full_binary_prepared.csv "
+            "Output Parquet path (default: Papyrus_pp_prepared.parquet, "
+            "Papyrus_full_prepared.parquet, or Papyrus_full_binary_prepared.parquet "
             "when --include-binary is set)."
         ),
     )
@@ -1131,7 +1261,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--resume",
         action="store_true",
         help=(
-            "With --include-binary: append to an existing partial output CSV, "
+            "With --include-binary: rebuild from an existing partial Parquet file, "
             "skipping the quantitative pass and continuing the Activity_class "
             "pass from the row count already on disk."
         ),

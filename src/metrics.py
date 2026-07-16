@@ -150,3 +150,85 @@ def print_metrics(y_true: np.ndarray, y_prob: np.ndarray, label: str = "") -> di
         flush=True,
     )
     return scores
+
+
+def _format_breakdown_line(
+    name: str,
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+) -> str:
+    """Format one breakout metrics line, or ``n/a`` when undefined.
+
+    Args:
+        name: Bucket label.
+        y_true: Labels for the bucket.
+        y_prob: Probabilities for the bucket.
+
+    Returns:
+        A single printable summary line.
+    """
+    n = int(y_true.shape[0])
+    if n == 0:
+        return f"{name}: n=0  n/a"
+    active_frac = float(np.mean(y_true))
+    if len(np.unique(y_true)) < 2:
+        return (
+            f"{name}: n={n}  active_frac={active_frac:.3f}  "
+            f"n/a (single class)"
+        )
+    scores = compute_metrics(y_true, y_prob)
+    return (
+        f"{name}: n={n}  active_frac={active_frac:.3f}  "
+        f"AUROC={scores['auroc']:.4f}  AUPRC={scores['auprc']:.4f}  "
+        f"F1={scores['f1']:.4f}"
+    )
+
+
+def print_breakdowns(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    protein_known: np.ndarray,
+    scaffold_known: np.ndarray,
+    label: str = "",
+) -> dict[str, dict[str, float]]:
+    """Print overall and known/unknown protein and scaffold breakout metrics.
+
+    Args:
+        y_true: Ground-truth binary labels for the eval set.
+        y_prob: Predicted positive-class probabilities.
+        protein_known: Boolean mask; ``True`` when the protein was in train.
+        scaffold_known: Boolean mask; ``True`` when the scaffold was in train.
+        label: Optional prefix identifying the evaluation set.
+
+    Returns:
+        Nested mapping of bucket name to metric dictionaries (empty dict when
+        a bucket is ``n/a``).
+    """
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    protein_known = np.asarray(protein_known, dtype=bool)
+    scaffold_known = np.asarray(scaffold_known, dtype=bool)
+    prefix = f"{label} " if label else ""
+    print(f"\n{prefix}novelty breakouts:", flush=True)
+
+    buckets: dict[str, np.ndarray] = {
+        "overall": np.ones(y_true.shape[0], dtype=bool),
+        "protein_known": protein_known,
+        "protein_unknown": ~protein_known,
+        "scaffold_known": scaffold_known,
+        "scaffold_unknown": ~scaffold_known,
+        "prot_known_scaff_known": protein_known & scaffold_known,
+        "prot_known_scaff_unknown": protein_known & ~scaffold_known,
+        "prot_unknown_scaff_known": ~protein_known & scaffold_known,
+        "prot_unknown_scaff_unknown": ~protein_known & ~scaffold_known,
+    }
+
+    results: dict[str, dict[str, float]] = {}
+    for name, mask in buckets.items():
+        line = _format_breakdown_line(f"  {name}", y_true[mask], y_prob[mask])
+        print(line, flush=True)
+        if mask.any() and len(np.unique(y_true[mask])) >= 2:
+            results[name] = compute_metrics(y_true[mask], y_prob[mask])
+        else:
+            results[name] = {}
+    return results

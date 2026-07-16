@@ -148,6 +148,23 @@ class FeatureDataset:
             )
         return np.load(path)
 
+    def load_years(self) -> np.ndarray:
+        """Load per-row publication years (``-1`` when missing).
+
+        Returns:
+            An ``int32`` array of shape ``(n_rows,)``. Missing years are ``-1``.
+
+        Raises:
+            FileNotFoundError: If ``years.npy`` is missing (rebuild features).
+        """
+        path = os.path.join(self.directory, "years.npy")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Missing {path}; rebuild features from a Papyrus Parquet "
+                "build that includes Year."
+            )
+        return np.load(path)
+
 
 def subset_to_memmap(dataset: "FeatureDataset", indices: np.ndarray, out_path: str) -> np.memmap:
     """Copy selected rows of a feature matrix into a new contiguous memmap.
@@ -375,6 +392,7 @@ def build_features(
     phs: list[float] = []
     temps: list[float] = []
     ys: list[float] = []
+    years: list[int] = []
     if verbose:
         print("[features] pass 1: streaming + indexing rows", flush=True)
     for kept, row in enumerate(iter_prepared_rows(csv_path, limit=limit), start=1):
@@ -386,6 +404,7 @@ def build_features(
         assay_ids.append(_ASSAY_TO_INDEX[row.assay_type])
         phs.append(row.ph)
         temps.append(row.temp)
+        years.append(-1 if row.year is None else int(row.year))
         if row.activity_label is not None:
             ys.append(float(row.activity_label))
         else:
@@ -423,6 +442,7 @@ def build_features(
     ph_arr = np.asarray(phs, dtype=np.float32)
     temp_arr = np.asarray(temps, dtype=np.float32)
     y_arr = np.asarray(ys, dtype=np.float32)
+    years_arr = np.asarray(years, dtype=np.int32)
 
     # Ensure embeddings exist for every distinct entity.
     pemb: HFEmbedder = protein_embedder(protein_model, device=device)
@@ -477,10 +497,12 @@ def build_features(
     X.flush()
     del X
 
-    # Persist labels, protein/scaffold groups and metadata.
+    # Persist labels, protein/scaffold groups, years and metadata.
     np.save(os.path.join(directory, "y.npy"), y_arr)
     np.save(os.path.join(directory, "groups.npy"), prot_ids_arr.astype(np.int32))
     np.save(os.path.join(directory, "scaffold_groups.npy"), scaffold_ids_arr)
+    np.save(os.path.join(directory, "years.npy"), years_arr)
+    n_dated = int(np.sum(years_arr >= 0))
     meta = {
         "n_rows": n_rows,
         "n_features": n_features,
@@ -494,6 +516,8 @@ def build_features(
         "include_assay_context": include_assay_context,
         "assay_types": list(config.ASSAY_TYPES),
         "n_scaffolds": len(scaffold_index),
+        "has_year": n_dated > 0,
+        "n_dated_rows": n_dated,
     }
     with open(meta_path, "w") as handle:
         json.dump(meta, handle, indent=2)

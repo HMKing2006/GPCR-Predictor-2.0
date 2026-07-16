@@ -2,7 +2,9 @@
 
 Each candidate is trained on the train split and scored on the validation split,
 with metrics printed as soon as the candidate finishes. The candidate with the
-highest validation AUROC is finally evaluated on the held-out test split and saved.
+highest validation AUROC is finally evaluated on the held-out test split (with
+protein/scaffold novelty breakouts) and saved. Pass ``--split-mode time`` for a
+percentage-based publication-year split instead of double-cold.
 """
 
 from __future__ import annotations
@@ -14,8 +16,7 @@ from typing import Any, Optional
 import config
 from src.featurize import build_features
 from src.models import BaseRegressor
-from src.splits import train_val_test_split
-from train import evaluate_on_indices, fit_on_indices
+from train import _resolve_split, evaluate_on_indices, fit_on_indices
 
 # Every entry inherits MLP defaults including early stopping; ``epochs`` is a
 # ceiling, not the actual run length.
@@ -110,11 +111,7 @@ def run_grid_search(args: argparse.Namespace) -> str:
         activity_threshold_nm=args.activity_threshold_nm,
         include_assay_context=args.include_assay_context,
     )
-    protein_groups = dataset.load_groups()
-    scaffold_groups = dataset.load_scaffold_groups()
-    split = train_val_test_split(
-        protein_groups, scaffold_groups, dataset.signature, seed=args.seed, verbose=verbose
-    )
+    split = _resolve_split(dataset, args, include_val=True, verbose=verbose)
 
     grid = build_grid(args.include_rf)
     best_model: Optional[BaseRegressor] = None
@@ -148,7 +145,13 @@ def run_grid_search(args: argparse.Namespace) -> str:
     print(f"\n[grid] best (val AUROC={best_auroc:.4f}): {best_desc}")
     print("[grid] best model test-set performance:")
     evaluate_on_indices(
-        best_model, dataset, split["test"], label="test", verbose=True, tag="grid_test"
+        best_model,
+        dataset,
+        split["test"],
+        label="test",
+        verbose=True,
+        tag="grid_test",
+        train_idx=split["train"],
     )
 
     os.makedirs(config.MODELS_DIR, exist_ok=True)
@@ -178,6 +181,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--seed", type=int, default=config.RANDOM_SEED)
+    p.add_argument(
+        "--split-mode",
+        choices=["double-cold", "time"],
+        default="double-cold",
+        help=(
+            "Outer split strategy: double-cold protein+scaffold (default) or "
+            "percentage-based publication-year time split."
+        ),
+    )
+    p.add_argument(
+        "--val-fraction",
+        type=float,
+        default=config.GRID_VAL_FRACTION,
+        help="Validation fraction (double-cold row target or temporal dated-row target).",
+    )
+    p.add_argument(
+        "--test-fraction",
+        type=float,
+        default=config.GRID_TEST_FRACTION,
+        help="Test fraction (double-cold row target or temporal dated-row target).",
+    )
     p.add_argument("--output", default=None, help="Output joblib path for the best model.")
     p.add_argument("--rebuild-features", action="store_true")
     p.add_argument(

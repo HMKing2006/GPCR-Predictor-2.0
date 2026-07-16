@@ -1,9 +1,10 @@
 """Train a single 50 nM binder / non-binder classifier.
 
 Builds (or reuses) the cached feature matrix, applies an 80/20 double-cold
-(protein + Murcko scaffold) split, trains the requested model (random forest by
-default, or an MLP), prints classification metrics on the held-out test set, and
-saves the model as a joblib file. The core routines are imported by
+(protein + Murcko scaffold) split by default (or a percentage-based publication
+year time split with ``--split-mode time``), trains the requested model,
+prints classification metrics and novelty breakouts on the held-out test set,
+and saves the model as a joblib file. The core routines are imported by
 ``grid_search.py``.
 """
 
@@ -19,9 +20,9 @@ import config
 from src.data_prep import binarize_pactivity
 from src.featurize import FeatureDataset, build_features, subset_to_memmap
 from src.ligand_repr import canonical_ligand_repr
-from src.metrics import print_metrics
+from src.metrics import print_breakdowns, print_metrics
 from src.models import BaseRegressor, build_model
-from src.splits import train_test_split
+from src.splits import get_or_create_time_split, train_test_split
 
 
 def collect_hyperparams(args: argparse.Namespace, model_type: str) -> dict[str, Any]:
@@ -138,6 +139,7 @@ def evaluate_on_indices(
     label: str,
     verbose: bool = True,
     tag: str = "eval",
+    train_idx: Optional[np.ndarray] = None,
 ) -> dict[str, float]:
     """Evaluate a fitted model on a subset of rows.
 
@@ -148,6 +150,8 @@ def evaluate_on_indices(
         label: Label used in the printed metrics line.
         verbose: If ``True``, print the metrics.
         tag: Filename tag for the temporary split memmap.
+        train_idx: Optional training indices used to compute known/unknown
+            protein and scaffold breakouts relative to train.
 
     Returns:
         The metric mapping (``accuracy``, ``precision``, ``recall``, ``f1``,
@@ -168,7 +172,98 @@ def evaluate_on_indices(
     scores = compute_metrics(y_eval, preds)
     if verbose:
         print_metrics(y_eval, preds, label=label)
+        if train_idx is not None:
+            train_proteins = dataset.load_groups()[train_idx]
+            train_scaffolds = dataset.load_scaffold_groups()[train_idx]
+            eval_proteins = dataset.load_groups()[idx]
+            eval_scaffolds = dataset.load_scaffold_groups()[idx]
+            protein_known = np.isin(eval_proteins, train_proteins)
+            scaffold_known = np.isin(eval_scaffolds, train_scaffolds)
+            print_breakdowns(
+                y_eval,
+                preds,
+                protein_known,
+                scaffold_known,
+                label=label,
+            )
     return scores
+
+
+def _resolve_split(
+    dataset: FeatureDataset,
+    args: argparse.Namespace,
+    *,
+    include_val: bool,
+    verbose: bool,
+) -> dict[str, np.ndarray]:
+    """Build the requested train/val/test split for a dataset.
+
+    Args:
+        dataset: Feature dataset with group / year arrays on disk.
+        args: Parsed CLI arguments (expects ``split_mode``, fractions, seed).
+        include_val: Whether a validation fold is required.
+        verbose: Progress logging.
+
+    Returns:
+        Split mapping with at least ``train`` and ``test``.
+
+    Raises:
+        SystemExit: If a time split is requested without dated rows.
+    """
+    if args.split_mode == "time":
+        try:
+            years = dataset.load_years()
+        except FileNotFoundError as exc:
+            raise SystemExit(str(exc)) from exc
+        if int(np.sum(years >= 0)) == 0:
+            raise SystemExit(
+                "Time split requires dated rows. Rebuild Papyrus as Parquet "
+                "(with Year) and rebuild features."
+            )
+        val_fraction = float(args.val_fraction)
+        if not include_val:
+            # Fold the temporal val window into train for two-way train/test.
+            return get_or_create_time_split(
+                years,
+                dataset.signature,
+                val_fraction=val_fraction,
+                test_fraction=float(args.test_fraction),
+                include_val=False,
+                seed=args.seed,
+                verbose=verbose,
+            )
+        return get_or_create_time_split(
+            years,
+            dataset.signature,
+            val_fraction=val_fraction,
+            test_fraction=float(args.test_fraction),
+            include_val=True,
+            seed=args.seed,
+            verbose=verbose,
+        )
+
+    protein_groups = dataset.load_groups()
+    scaffold_groups = dataset.load_scaffold_groups()
+    if include_val:
+        from src.splits import train_val_test_split
+
+        return train_val_test_split(
+            protein_groups,
+            scaffold_groups,
+            dataset.signature,
+            val_fraction=float(args.val_fraction),
+            test_fraction=float(args.test_fraction),
+            seed=args.seed,
+            verbose=verbose,
+        )
+    return train_test_split(
+        protein_groups,
+        scaffold_groups,
+        dataset.signature,
+        test_fraction=float(args.test_fraction),
+        seed=args.seed,
+        verbose=verbose,
+    )
 
 
 def run_training(args: argparse.Namespace) -> str:
@@ -191,16 +286,7 @@ def run_training(args: argparse.Namespace) -> str:
         activity_threshold_nm=args.activity_threshold_nm,
         include_assay_context=args.include_assay_context,
     )
-    protein_groups = dataset.load_groups()
-    scaffold_groups = dataset.load_scaffold_groups()
-    split = train_test_split(
-        protein_groups,
-        scaffold_groups,
-        dataset.signature,
-        test_fraction=args.test_fraction,
-        seed=args.seed,
-        verbose=verbose,
-    )
+    split = _resolve_split(dataset, args, include_val=False, verbose=verbose)
 
     hyperparams = collect_hyperparams(args, args.model)
     model = fit_on_indices(
@@ -214,7 +300,14 @@ def run_training(args: argparse.Namespace) -> str:
         verbose=verbose,
     )
     print("\n[train] test-set performance:")
-    evaluate_on_indices(model, dataset, split["test"], label="test", verbose=True)
+    evaluate_on_indices(
+        model,
+        dataset,
+        split["test"],
+        label="test",
+        verbose=True,
+        train_idx=split["train"],
+    )
 
     os.makedirs(config.MODELS_DIR, exist_ok=True)
     output = args.output or os.path.join(config.MODELS_DIR, f"{args.model}_model.joblib")
@@ -244,6 +337,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--test-fraction", type=float, default=config.TEST_FRACTION)
+    p.add_argument(
+        "--val-fraction",
+        type=float,
+        default=config.GRID_VAL_FRACTION,
+        help=(
+            "Validation fraction (grid search; for --split-mode time also used "
+            "to place the temporal val year window, which is merged into train "
+            "in train.py)."
+        ),
+    )
+    p.add_argument(
+        "--split-mode",
+        choices=["double-cold", "time"],
+        default="double-cold",
+        help=(
+            "Outer split strategy: double-cold protein+scaffold (default) or "
+            "percentage-based publication-year time split."
+        ),
+    )
     p.add_argument("--seed", type=int, default=config.RANDOM_SEED)
     p.add_argument("--output", default=None, help="Output joblib path.")
     p.add_argument("--rebuild-features", action="store_true", help="Force feature rebuild.")

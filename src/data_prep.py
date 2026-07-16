@@ -1,10 +1,12 @@
-"""Streaming cleaning and label preparation for the BindingDB CSV.
+"""Streaming cleaning and label preparation for BindingDB CSV / Papyrus Parquet.
 
-This module reads the raw BindingDB export row by row (never loading the whole
+This module reads prepared training tables row by row (never loading the whole
 file into memory), cleans ligand SMILES (salt removal + canonicalization),
 converts activity measurements to pActivity, explodes rows that carry several
 assay measurements, drops censored/missing values, and yields tidy
 ``PreparedRow`` records ready for embedding and featurization.
+
+BindingDB inputs remain CSV; Papyrus prepared builds are Parquet (``.parquet``).
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ import math
 import sys
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Iterable, Iterator, Optional
+from typing import Any, Iterable, Iterator, Mapping, Optional
 
 import numpy as np
 from rdkit import Chem, RDLogger
@@ -24,11 +26,12 @@ import config
 
 RDLogger.DisableLog("rdApp.*")
 
-# Raw CSV column names.
+# Raw CSV / Parquet column names.
 COL_SMILES = "Ligand SMILES"
 COL_PH = "pH"
 COL_TEMP = "Temp (C)"
 COL_SEQ = "BindingDB Target Chain Sequence 1"
+COL_YEAR = "Year"
 
 # Mapping from assay type to its raw activity column (values in nM).
 ASSAY_COLUMNS: dict[str, str] = {
@@ -59,6 +62,7 @@ class PreparedRow:
         activity_label: Optional explicit binder class (``0`` / ``1``) from
             Papyrus ``Activity_class`` rows. When set, featurization prefers
             this over binarizing ``pactivity``.
+        year: Optional publication year from Papyrus (used for temporal splits).
     """
 
     smiles: str
@@ -68,6 +72,7 @@ class PreparedRow:
     temp: float
     pactivity: float
     activity_label: Optional[float] = None
+    year: Optional[int] = None
 
 
 @lru_cache(maxsize=200_000)
@@ -227,11 +232,138 @@ def _parse_activity_label(raw: str) -> Optional[float]:
     return None
 
 
+def _parse_year(raw: object) -> Optional[int]:
+    """Parse an optional publication-year cell.
+
+    Args:
+        raw: Cell value from CSV or Parquet.
+
+    Returns:
+        Integer year in ``[1900, 2100]``, or ``None`` when missing/invalid.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, float) and math.isnan(raw):
+        return None
+    text = str(raw).strip()
+    if not text or text.lower() == "nan":
+        return None
+    try:
+        year = int(float(text))
+    except (TypeError, ValueError):
+        return None
+    if year < 1900 or year > 2100:
+        return None
+    return year
+
+
+def _cell(row: Mapping[str, Any], key: str) -> str:
+    """Return a string cell value from a mapping, treating nulls as empty.
+
+    Args:
+        row: Row mapping.
+        key: Column name.
+
+    Returns:
+        String value (possibly empty).
+    """
+    value = row.get(key)
+    if value is None:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    return str(value)
+
+
+def _yield_prepared_from_raw(row: Mapping[str, Any]) -> Iterator[PreparedRow]:
+    """Convert one raw prepared-table row into zero or more ``PreparedRow``s.
+
+    Args:
+        row: Mapping of column name to cell value.
+
+    Yields:
+        Cleaned assay-exploded ``PreparedRow`` instances.
+    """
+    sequence = _cell(row, COL_SEQ).strip()
+    if not sequence:
+        return
+
+    smiles = canonicalize_smiles(_cell(row, COL_SMILES))
+    if smiles is None:
+        return
+
+    ph = parse_ph(_cell(row, COL_PH))
+    if ph is None:
+        ph = config.DEFAULT_PH
+    temp = parse_temperature(_cell(row, COL_TEMP))
+    if temp is None:
+        temp = config.DEFAULT_TEMP_C
+
+    activity_label = _parse_activity_label(_cell(row, COL_ACTIVITY_LABEL))
+    year = _parse_year(row.get(COL_YEAR))
+
+    for assay_type, column in ASSAY_COLUMNS.items():
+        activity = _parse_activity_nm(_cell(row, column))
+        if activity is None:
+            continue
+        yield PreparedRow(
+            smiles=smiles,
+            sequence=sequence,
+            assay_type=assay_type,
+            ph=ph,
+            temp=temp,
+            pactivity=activity_to_pactivity(activity),
+            activity_label=activity_label,
+            year=year,
+        )
+
+
+def _iter_csv_rows(path: str, limit: Optional[int]) -> Iterator[Mapping[str, Any]]:
+    """Stream raw rows from a prepared CSV.
+
+    Args:
+        path: CSV path.
+        limit: Optional cap on raw input rows.
+
+    Yields:
+        Row mappings.
+    """
+    with open(path, newline="") as handle:
+        reader = csv.DictReader(handle)
+        for read_count, row in enumerate(reader):
+            if limit is not None and read_count >= limit:
+                break
+            yield row
+
+
+def _iter_parquet_rows(path: str, limit: Optional[int]) -> Iterator[Mapping[str, Any]]:
+    """Stream raw rows from a prepared Parquet file.
+
+    Args:
+        path: Parquet path.
+        limit: Optional cap on raw input rows.
+
+    Yields:
+        Row mappings.
+    """
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(path)
+    emitted = 0
+    for batch in pf.iter_batches(batch_size=65_536):
+        rows = batch.to_pylist()
+        for row in rows:
+            if limit is not None and emitted >= limit:
+                return
+            yield row
+            emitted += 1
+
+
 def iter_prepared_rows(
     csv_path: str = config.TRAIN_CSV,
     limit: Optional[int] = None,
 ) -> Iterator[PreparedRow]:
-    """Stream cleaned training examples from the BindingDB CSV.
+    """Stream cleaned training examples from a prepared CSV or Parquet file.
 
     Each raw row may yield multiple ``PreparedRow`` records: one per assay type
     that carries a valid (non-censored) measurement. Rows lacking a parseable
@@ -239,51 +371,23 @@ def iter_prepared_rows(
 
     When an ``Activity Label`` column is present and parseable, that explicit
     class is attached to every assay yield from the row (Papyrus binary path).
+    An optional ``Year`` column is attached when present (Papyrus Parquet).
 
     Args:
-        csv_path: Path to the prepared BindingDB CSV.
+        csv_path: Path to the prepared BindingDB CSV or Papyrus Parquet file.
         limit: Optional cap on the number of *raw input rows* read (useful for
             smoke tests). ``None`` reads the whole file.
 
     Yields:
         ``PreparedRow`` instances in file order.
     """
-    with open(csv_path, newline="") as handle:
-        reader = csv.DictReader(handle)
-        for read_count, row in enumerate(reader):
-            if limit is not None and read_count >= limit:
-                break
-
-            sequence = (row.get(COL_SEQ) or "").strip()
-            if not sequence:
-                continue
-
-            smiles = canonicalize_smiles(row.get(COL_SMILES) or "")
-            if smiles is None:
-                continue
-
-            ph = parse_ph(row.get(COL_PH) or "")
-            if ph is None:
-                ph = config.DEFAULT_PH
-            temp = parse_temperature(row.get(COL_TEMP) or "")
-            if temp is None:
-                temp = config.DEFAULT_TEMP_C
-
-            activity_label = _parse_activity_label(row.get(COL_ACTIVITY_LABEL) or "")
-
-            for assay_type, column in ASSAY_COLUMNS.items():
-                activity = _parse_activity_nm(row.get(column) or "")
-                if activity is None:
-                    continue
-                yield PreparedRow(
-                    smiles=smiles,
-                    sequence=sequence,
-                    assay_type=assay_type,
-                    ph=ph,
-                    temp=temp,
-                    pactivity=activity_to_pactivity(activity),
-                    activity_label=activity_label,
-                )
+    lower = csv_path.lower()
+    if lower.endswith((".parquet", ".pq")):
+        raw_rows = _iter_parquet_rows(csv_path, limit)
+    else:
+        raw_rows = _iter_csv_rows(csv_path, limit)
+    for row in raw_rows:
+        yield from _yield_prepared_from_raw(row)
 
 
 def unique_entities(rows: Iterable[PreparedRow]) -> tuple[list[str], list[str]]:
