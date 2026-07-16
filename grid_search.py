@@ -102,7 +102,7 @@ def run_grid_search(args: argparse.Namespace) -> str:
     """
     verbose = not args.quiet
     dataset = build_features(
-        csv_path=args.csv,
+        csv_path=args.data,
         protein_model=args.protein_model,
         ligand_model=args.ligand_model,
         limit=args.limit,
@@ -168,7 +168,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         The configured :class:`argparse.ArgumentParser`.
     """
     p = argparse.ArgumentParser(description="Grid-search binder classifiers and hyperparameters.")
-    p.add_argument("--csv", default=config.TRAIN_CSV)
+    p.add_argument(
+        "--data",
+        default=config.TRAIN_CSV,
+        help="Prepared training data path (CSV or Parquet).",
+    )
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--protein-model", default=config.DEFAULT_PROTEIN_MODEL)
     p.add_argument(

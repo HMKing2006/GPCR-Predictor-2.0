@@ -770,6 +770,16 @@ def _commit_snapshot(temporary: str, destination: str) -> None:
     backup = f"{destination}.old-{os.getpid()}"
     if os.path.exists(backup):
         shutil.rmtree(backup)
+    if os.path.exists(destination):
+        os.replace(destination, backup)
+    try:
+        os.replace(temporary, destination)
+    except Exception:
+        if os.path.exists(backup) and not os.path.exists(destination):
+            os.replace(backup, destination)
+        raise
+    if os.path.exists(backup):
+        shutil.rmtree(backup)
 
 
 def _recover_stale_snapshot_artifacts(dataset_directory: str) -> None:
@@ -803,16 +813,6 @@ def _recover_stale_snapshot_artifacts(dataset_directory: str) -> None:
             path = os.path.join(dataset_directory, name)
             if os.path.isdir(path):
                 shutil.rmtree(path)
-    if os.path.exists(destination):
-        os.replace(destination, backup)
-    try:
-        os.replace(temporary, destination)
-    except Exception:
-        if os.path.exists(backup) and not os.path.exists(destination):
-            os.replace(backup, destination)
-        raise
-    if os.path.exists(backup):
-        shutil.rmtree(backup)
 
 
 def _write_row_snapshot(

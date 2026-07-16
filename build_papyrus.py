@@ -5,14 +5,14 @@ quantitative Ki/Kd/IC50/EC50/Other values, joins protein sequences, and writes
 a Parquet file that :func:`src.data_prep.iter_prepared_rows` can consume::
 
     python build_papyrus.py --subset plusplus
-    python train.py --csv data/train/Papyrus_pp_prepared.parquet --rebuild-features
+    python train.py --data data/train/Papyrus_pp_prepared.parquet --rebuild-features
 
     python build_papyrus.py --subset full
-    python train.py --csv data/train/Papyrus_full_prepared.parquet --rebuild-features
+    python train.py --data data/train/Papyrus_full_prepared.parquet --rebuild-features
 
     # Quant + Papyrus Activity_class binary rows (use --limit to cap size)
     python build_papyrus.py --subset full --include-binary --limit 5000000
-    python train.py --csv data/train/Papyrus_full_binary_prepared.parquet --rebuild-features
+    python train.py --data data/train/Papyrus_full_binary_prepared.parquet --rebuild-features
 
     # Resume a failed binary build (skips quantitative pass, appends binary rows)
     python build_papyrus.py --subset full --include-binary --resume --no-download

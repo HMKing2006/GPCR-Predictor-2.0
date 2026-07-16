@@ -113,15 +113,15 @@ Useful flags:
 | `--limit N` | Cap total output rows (quant written before binary) |
 | `--resume` | Resume the binary pass from an existing valid prepared Parquet |
 
-Train or grid-search on Papyrus by passing `--csv` (the flag accepts Parquet
+Train or grid-search on Papyrus by passing `--data` (CSV or Parquet prepared
 paths). Use `--rebuild-features` after changing row-level settings such as the
 activity cutoff or assay context. Switching prepared files selects another
 readable dataset cache directory automatically:
 
 ```bash
-python train.py --csv data/train/Papyrus_pp_prepared.parquet --rebuild-features
-python grid_search.py --csv data/train/Papyrus_full_prepared.parquet --rebuild-features
-python grid_search.py --csv data/train/Papyrus_full_binary_prepared.parquet --rebuild-features
+python train.py --data data/train/Papyrus_pp_prepared.parquet --rebuild-features
+python grid_search.py --data data/train/Papyrus_full_prepared.parquet --rebuild-features
+python grid_search.py --data data/train/Papyrus_full_binary_prepared.parquet --rebuild-features
 ```
 
 Dataset caches are grouped under
@@ -232,7 +232,7 @@ sizes are printed.
 
 ```bash
 python grid_search.py \
-  --csv data/train/Papyrus_full_prepared.parquet \
+  --data data/train/Papyrus_full_prepared.parquet \
   --split-mode time \
   --val-fraction 0.1 \
   --test-fraction 0.1 \
@@ -252,10 +252,10 @@ python train.py
 python train.py --include-assay-context --rebuild-features
 
 # Papyrus++
-python train.py --csv data/train/Papyrus_pp_prepared.parquet --rebuild-features
+python train.py --data data/train/Papyrus_pp_prepared.parquet --rebuild-features
 
 # Temporal split (Papyrus with Year)
-python train.py --csv data/train/Papyrus_pp_prepared.parquet --split-mode time --rebuild-features
+python train.py --data data/train/Papyrus_pp_prepared.parquet --split-mode time --rebuild-features
 
 # MLP with custom hyperparameters
 python train.py --model mlp --epochs 30 --hidden-dim 2048 --learning-rate 5e-4
@@ -285,10 +285,10 @@ when the outer split is temporal.
 python grid_search.py
 
 # Papyrus++
-python grid_search.py --csv data/train/Papyrus_pp_prepared.parquet --rebuild-features
+python grid_search.py --data data/train/Papyrus_pp_prepared.parquet --rebuild-features
 
 # Time split with novelty breakouts on the final test set
-python grid_search.py --csv data/train/Papyrus_pp_prepared.parquet --split-mode time --rebuild-features
+python grid_search.py --data data/train/Papyrus_pp_prepared.parquet --split-mode time --rebuild-features
 
 # Include assay context
 python grid_search.py --include-assay-context --rebuild-features
