@@ -71,8 +71,9 @@ def fit_on_indices(
 ) -> BaseRegressor:
     """Materialize the training rows and fit a model on them.
 
-    Continuous pActivity labels are binarized at
-    ``config.ACTIVITY_THRESHOLD_NM`` before fitting.
+    Labels from the feature cache are used as binder classes when
+    ``dataset.labels_are_binary`` is set (default after rebuild); otherwise
+    continuous pActivity is binarized at ``config.ACTIVITY_THRESHOLD_NM``.
 
     Args:
         dataset: The feature dataset.
@@ -90,7 +91,12 @@ def fit_on_indices(
     """
     tmp_path = os.path.join(dataset.directory, f"split_{tag}.dat")
     X_train = subset_to_memmap(dataset, train_idx, tmp_path)
-    y_train = binarize_pactivity(dataset.load_y()[train_idx])
+    y_raw = dataset.load_y()[train_idx]
+    y_train = (
+        y_raw
+        if dataset.labels_are_binary
+        else binarize_pactivity(y_raw, threshold_nm=dataset.activity_threshold_nm)
+    )
     build_kwargs = dict(hyperparams)
     if model_type == "mlp":
         build_kwargs["protein_dim"] = dataset.protein_dim
@@ -104,14 +110,14 @@ def fit_on_indices(
         "n_features": dataset.n_features,
         "model_type": model_type,
         "hyperparams": hyperparams,
-        "activity_threshold_nm": config.ACTIVITY_THRESHOLD_NM,
+        "activity_threshold_nm": dataset.activity_threshold_nm,
         "task": "classification",
     }
     if verbose:
         pos_frac = float(np.mean(y_train))
         print(
             f"[train] fitting {model_type} on {len(train_idx)} rows "
-            f"(active_frac={pos_frac:.3f} @ {config.ACTIVITY_THRESHOLD_NM:g} nM)"
+            f"(active_frac={pos_frac:.3f} @ {dataset.activity_threshold_nm:g} nM)"
         )
     fit_kwargs: dict[str, Any] = {"verbose": verbose}
     if model_type == "mlp":
@@ -146,7 +152,12 @@ def evaluate_on_indices(
     """
     tmp_path = os.path.join(dataset.directory, f"split_{tag}.dat")
     X_eval = subset_to_memmap(dataset, idx, tmp_path)
-    y_eval = binarize_pactivity(dataset.load_y()[idx])
+    y_raw = dataset.load_y()[idx]
+    y_eval = (
+        y_raw
+        if dataset.labels_are_binary
+        else binarize_pactivity(y_raw, threshold_nm=dataset.activity_threshold_nm)
+    )
     preds = model.predict(X_eval)
     del X_eval
     from src.metrics import compute_metrics
@@ -174,6 +185,7 @@ def run_training(args: argparse.Namespace) -> str:
         limit=args.limit,
         verbose=verbose,
         rebuild=args.rebuild_features,
+        activity_threshold_nm=args.activity_threshold_nm,
     )
     groups = dataset.load_groups()
     split = train_test_split(
@@ -225,6 +237,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=config.RANDOM_SEED)
     p.add_argument("--output", default=None, help="Output joblib path.")
     p.add_argument("--rebuild-features", action="store_true", help="Force feature rebuild.")
+    p.add_argument(
+        "--activity-threshold-nm",
+        type=float,
+        default=config.ACTIVITY_THRESHOLD_NM,
+        help=(
+            "Binder cutoff in nM for quantitative rows (default: 50). "
+            "Papyrus Activity_class rows keep their explicit Activity Label."
+        ),
+    )
     p.add_argument("--quiet", action="store_true", help="Reduce progress output.")
 
     # Random-forest hyperparameters.

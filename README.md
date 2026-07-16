@@ -39,25 +39,26 @@ preparation:
 - `pH` (missing imputed to 7.4) and `Temp (C)` (parsed, clipped, missing imputed
   to 25.0 C) are used as scalar features. Assay type is one-hot encoded.
 
-At train time, continuous pActivity is binarized at **50 nM**
-(`config.ACTIVITY_THRESHOLD_NM`): activity ≤ 50 nM → active (1).
+Labels are stored as binder / non-binder (50 nM cutoff,
+`config.ACTIVITY_THRESHOLD_NM`) when features are built. Rows with an optional
+`Activity Label` column (Papyrus binary builds) use that class directly.
 
 ### Papyrus
 
 Build a BindingDB-compatible prepared CSV from the [Papyrus](https://zenodo.org/records/13787634)
 dataset with `build_papyrus.py`. The script downloads (if needed), streams, filters
-to exact Ki/Kd/IC50/EC50 values, joins protein sequences, and writes a CSV that
-the existing training pipeline consumes unchanged.
+to exact Ki/Kd/IC50/EC50/**Other** values (`type_other` included), joins protein
+sequences, and writes a CSV the training pipeline can consume.
 
-**Papyrus++** (default, ~1–2M high-quality reproducible rows):
+**Papyrus++** (default, high-quality reproducible rows):
 
 ```bash
 python build_papyrus.py --subset plusplus
 # output: data/train/Papyrus_pp_prepared.csv
 ```
 
-**Full Papyrus** `without_stereochemistry` (~60M compound–target pairs; multi-GB
-download, hours to build, CSV may exceed 10 GB):
+**Full Papyrus** quantitative build (`without_stereochemistry`; multi-GB
+download, ~2.4M exact Ki/Kd/IC50/EC50/Other rows after filters):
 
 ```bash
 python build_papyrus.py --subset full
@@ -67,26 +68,49 @@ python build_papyrus.py --subset full
 python build_papyrus.py --subset full --min-quality high
 ```
 
-Smoke test (first 10k rows):
+**Full + binary** (`Activity_class` rows, mostly inactive `N`, low quality).
+Quant rows are written first; reuse `--limit` to cap total size (recommended —
+the binary tail is ~56M rows):
+
+```bash
+python build_papyrus.py --subset full --include-binary --limit 5000000
+# default output: data/train/Papyrus_full_binary_prepared.csv
+# (~2.4M quant + ~2.6M binary when limit=5M)
+```
+
+Binary rows are encoded as `Other (nM)` sentinel values plus an `Activity Label`
+column (`0`/`1`). Override the path with `--output` if needed.
+
+Smoke test:
 
 ```bash
 python build_papyrus.py --subset plusplus --limit 10000
+# Full quant only (small limits never reach the binary region — that starts
+# after ~2–3M quantitative rows):
+python build_papyrus.py --subset full --limit 10000 --no-download
+# Quant + binary requires --limit above the quantitative row count, e.g.:
+python build_papyrus.py --subset full --include-binary --limit 3000000 --no-download
 ```
 
 Useful flags:
 
 | Flag | Purpose |
 |---|---|
+| `--include-binary` | Append Papyrus `Activity_class` rows (`--subset full` only) |
 | `--no-download` | Skip download; assume Papyrus data is already present |
 | `--disk-margin 0` | Relax papyrus-scripts free-disk check (default) |
 | `--chunk-size 500000` | Rows per streaming chunk |
 | `--output PATH` | Override output CSV path |
+| `--limit N` | Cap total output rows (quant written before binary) |
 
-Train or grid-search on Papyrus by passing `--csv`:
+Train or grid-search on Papyrus by passing `--csv`. **Always use
+`--rebuild-features`** after changing assay vocabulary (the assay one-hot is
+now 5-d including `Other`) or switching prepared CSVs:
 
 ```bash
 python train.py --csv data/train/Papyrus_pp_prepared.csv --rebuild-features
-python grid_search.py --csv data/train/Papyrus_pp_prepared.csv --rebuild-features
+python grid_search.py --csv data/train/Papyrus_full_prepared.csv --rebuild-features
+python grid_search.py --csv data/train/Papyrus_full_binary_prepared.csv --rebuild-features
 ```
 
 Each CSV gets its own feature-cache signature and cold-protein splits under
@@ -126,7 +150,9 @@ MoLFormer to an existing Morgan cache reuses the Morgan store.
 
 ## Feature vector
 
-`concat(protein_emb, ligand_repr, assay_onehot[4], pH[1], temp[1])`
+`concat(protein_emb, ligand_repr, assay_onehot[5], pH[1], temp[1])`
+
+Assay one-hot order is fixed in `config.ASSAY_TYPES`: IC50, EC50, Ki, Kd, Other.
 
 With the default MoLFormer ligand representation this is
 `concat(protein[1280], ligand[768], assay[4], pH, temp)`. With combined

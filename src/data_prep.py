@@ -202,6 +202,31 @@ def binarize_pactivity(
     return (np.asarray(y) >= thr).astype(np.float32)
 
 
+def _parse_activity_label(raw: str) -> Optional[float]:
+    """Parse an optional explicit binder label cell.
+
+    Args:
+        raw: Cell value such as ``"0"``, ``"1"``, ``"N"``, or ``"Y"``.
+
+    Returns:
+        ``0.0`` / ``1.0`` when recognized, else ``None``.
+    """
+    text = raw.strip().lower()
+    if not text:
+        return None
+    if text in {"0", "0.0", "n", "inactive", "false"}:
+        return 0.0
+    if text in {"1", "1.0", "y", "active", "true"}:
+        return 1.0
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if value in (0.0, 1.0):
+        return value
+    return None
+
+
 def iter_prepared_rows(
     csv_path: str = config.TRAIN_CSV,
     limit: Optional[int] = None,
@@ -211,6 +236,9 @@ def iter_prepared_rows(
     Each raw row may yield multiple ``PreparedRow`` records: one per assay type
     that carries a valid (non-censored) measurement. Rows lacking a parseable
     SMILES or sequence, or with no valid activity, are skipped.
+
+    When an ``Activity Label`` column is present and parseable, that explicit
+    class is attached to every assay yield from the row (Papyrus binary path).
 
     Args:
         csv_path: Path to the prepared BindingDB CSV.
@@ -241,6 +269,8 @@ def iter_prepared_rows(
             if temp is None:
                 temp = config.DEFAULT_TEMP_C
 
+            activity_label = _parse_activity_label(row.get(COL_ACTIVITY_LABEL) or "")
+
             for assay_type, column in ASSAY_COLUMNS.items():
                 activity = _parse_activity_nm(row.get(column) or "")
                 if activity is None:
@@ -252,6 +282,7 @@ def iter_prepared_rows(
                     ph=ph,
                     temp=temp,
                     pactivity=activity_to_pactivity(activity),
+                    activity_label=activity_label,
                 )
 
 

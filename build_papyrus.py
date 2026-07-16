@@ -1,14 +1,21 @@
 """Download Papyrus and write a BindingDB-compatible prepared CSV.
 
 Streams the Papyrus++ or full without_stereochemistry release, keeps exact
-quantitative Ki/Kd/IC50/EC50 values, joins protein sequences, and writes a CSV
-that :func:`src.data_prep.iter_prepared_rows` can consume unchanged::
+quantitative Ki/Kd/IC50/EC50/Other values, joins protein sequences, and writes
+a CSV that :func:`src.data_prep.iter_prepared_rows` can consume::
 
     python build_papyrus.py --subset plusplus
     python train.py --csv data/train/Papyrus_pp_prepared.csv --rebuild-features
 
     python build_papyrus.py --subset full
     python train.py --csv data/train/Papyrus_full_prepared.csv --rebuild-features
+
+    # Quant + Papyrus Activity_class binary rows (use --limit to cap size)
+    python build_papyrus.py --subset full --include-binary --limit 5000000
+    python train.py --csv data/train/Papyrus_full_binary_prepared.csv --rebuild-features
+
+    # Resume a failed binary build (skips quantitative pass, appends binary rows)
+    python build_papyrus.py --subset full --include-binary --resume --no-download
 
 The full subset is substantially larger (multi-GB download; the prepared CSV
 may exceed 10 GB and take hours to build). Prefer ``--subset plusplus`` unless
@@ -39,6 +46,8 @@ _OUTPUT_COLUMNS: list[str] = [
     "IC50 (nM)",
     "Kd (nM)",
     "EC50 (nM)",
+    "Other (nM)",
+    "Activity Label",
     "pH",
     "Temp (C)",
     "BindingDB Target Chain Sequence 1",
@@ -51,6 +60,7 @@ _TYPE_TO_ASSAY: list[tuple[str, str]] = [
     ("type_KD", "Kd (nM)"),
     ("type_IC50", "IC50 (nM)"),
     ("type_EC50", "EC50 (nM)"),
+    ("type_other", "Other (nM)"),
 ]
 
 _TYPE_COLUMNS: list[str] = [col for col, _ in _TYPE_TO_ASSAY]
@@ -60,9 +70,12 @@ _EXPLODE_COLUMNS: tuple[str, ...] = (
     "type_KD",
     "type_IC50",
     "type_EC50",
+    "type_other",
     "relation",
     "pchembl_value",
 )
+_ACTIVITY_CLASS_ACTIVE: frozenset[str] = frozenset({"y", "yes", "active", "1", "true"})
+_ACTIVITY_CLASS_INACTIVE: frozenset[str] = frozenset({"n", "no", "inactive", "0", "false"})
 
 
 def _require_papyrus() -> None:
@@ -85,17 +98,21 @@ def _require_papyrus() -> None:
         raise SystemExit(1) from None
 
 
-def _default_output(subset: str) -> str:
+def _default_output(subset: str, include_binary: bool = False) -> str:
     """Return the default prepared-CSV path for a subset name.
 
     Args:
         subset: Either ``"plusplus"`` or ``"full"``.
+        include_binary: If ``True`` and ``subset`` is ``full``, return the
+            quant+binary default path.
 
     Returns:
         Absolute path under ``data/train/``.
     """
     if subset == "plusplus":
         return config.PAPYRUS_PP_TRAIN_CSV
+    if include_binary:
+        return config.PAPYRUS_FULL_BINARY_TRAIN_CSV
     return config.PAPYRUS_FULL_TRAIN_CSV
 
 
@@ -318,7 +335,8 @@ def _type_flag_true(series: pd.Series) -> pd.Series:
     """Return a boolean mask for Papyrus type_* columns set to active.
 
     Args:
-        series: A ``type_Ki`` / ``type_KD`` / ``type_IC50`` / ``type_EC50`` column.
+        series: A ``type_Ki`` / ``type_KD`` / ``type_IC50`` / ``type_EC50`` /
+            ``type_other`` column.
 
     Returns:
         Boolean Series aligned with ``series``.
@@ -403,7 +421,7 @@ def _explode_semicolon_rows(chunk: pd.DataFrame, columns: tuple[str, ...]) -> pd
 
 
 def _filter_activity_types(chunk: pd.DataFrame) -> pd.DataFrame:
-    """Keep Ki/Kd/IC50/EC50 rows without papyrus-scripts chunked ``keep_type``.
+    """Keep Ki/Kd/IC50/EC50/Other rows without papyrus-scripts ``keep_type``.
 
     The upstream ``keep_type`` helper spins up joblib/swifter workers per chunk
     and, when chained through generators, can terminate the stream early. This
@@ -490,8 +508,8 @@ def _assay_column(row: pd.Series) -> Optional[str]:
         row: A filtered Papyrus activity row.
 
     Returns:
-        One of ``Ki (nM)``, ``Kd (nM)``, ``IC50 (nM)``, ``EC50 (nM)``, or
-        ``None`` if no recognized type flag is set.
+        One of ``Ki (nM)``, ``Kd (nM)``, ``IC50 (nM)``, ``EC50 (nM)``,
+        ``Other (nM)``, or ``None`` if no recognized type flag is set.
     """
     for type_col, assay_col in _TYPE_TO_ASSAY:
         if type_col not in row.index:
@@ -508,6 +526,28 @@ def _assay_column(row: pd.Series) -> Optional[str]:
     return None
 
 
+def _parse_activity_class(raw: Any) -> Optional[int]:
+    """Map a Papyrus ``Activity_class`` cell to binder / non-binder.
+
+    Args:
+        raw: Raw cell value (e.g. ``"N"`` or ``"Y"``).
+
+    Returns:
+        ``0`` for inactive, ``1`` for active, or ``None`` if unrecognized /
+        missing.
+    """
+    if raw is None or (isinstance(raw, float) and math.isnan(raw)):
+        return None
+    text = str(raw).strip().lower()
+    if not text or text == "nan":
+        return None
+    if text in _ACTIVITY_CLASS_INACTIVE:
+        return 0
+    if text in _ACTIVITY_CLASS_ACTIVE:
+        return 1
+    return None
+
+
 def convert_chunk(
     chunk: pd.DataFrame,
     proteins: dict[str, dict[str, str]],
@@ -517,7 +557,7 @@ def convert_chunk(
     limit: Optional[int],
     rows_written: int,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Convert one Papyrus activity chunk into BindingDB-schema rows.
+    """Convert one quantitative Papyrus chunk into BindingDB-schema rows.
 
     Args:
         chunk: Filtered activity chunk (exact relation, selected assay types).
@@ -583,6 +623,140 @@ def convert_chunk(
     return out, rows_written + len(out)
 
 
+def _count_existing_rows(path: str) -> tuple[int, int]:
+    """Count quantitative and binary rows in an existing prepared CSV.
+
+    Quantitative rows have an empty ``Activity Label``; binary rows set it to
+    ``0`` or ``1``.
+
+    Args:
+        path: Path to a prepared CSV written by this script.
+
+    Returns:
+        A tuple ``(quant_rows, binary_rows)``.
+    """
+    quant_rows = 0
+    binary_rows = 0
+    with open(path, newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            if str(row.get("Activity Label", "") or "").strip():
+                binary_rows += 1
+            else:
+                quant_rows += 1
+    return quant_rows, binary_rows
+
+
+def convert_binary_chunk(
+    chunk: pd.DataFrame,
+    proteins: dict[str, dict[str, str]],
+    stats: dict[str, int],
+    seen_ligands: set[str],
+    seen_proteins: set[str],
+    limit: Optional[int],
+    rows_written: int,
+    binary_skip: int = 0,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Convert Papyrus ``Activity_class`` rows into BindingDB-schema rows.
+
+    Binary rows have empty ``pchembl_value``. Inactive (``N``) rows get a
+    sentinel potency in ``Other (nM)`` and ``Activity Label=0``; active
+    (``Y``) rows use a strong-binder sentinel and ``Activity Label=1``.
+
+    Args:
+        chunk: Raw Papyrus chunk (binary rows only).
+        proteins: Protein metadata keyed by ``target_id``.
+        stats: Mutable skip/write counters updated in place.
+        seen_ligands: Mutable set of canonical SMILES written so far.
+        seen_proteins: Mutable set of sequences written so far.
+        limit: Optional cap on total output rows across all chunks.
+        rows_written: Number of rows already written before this chunk.
+        binary_skip: When resuming, skip this many converted binary rows before
+            writing (already present in the output file).
+
+    Returns:
+        A tuple ``(rows, rows_written_after, binary_skip_remaining)``.
+    """
+    out: list[dict[str, Any]] = []
+    for _, row in chunk.iterrows():
+        label = _parse_activity_class(row.get("Activity_class"))
+        if label is None:
+            stats["skipped_binary_class"] += 1
+            continue
+
+        target_id = str(row.get("target_id", "") or "").strip()
+        protein = proteins.get(target_id)
+        if protein is None:
+            stats["skipped_sequence"] += 1
+            continue
+
+        smiles = canonicalize_smiles(str(row.get("SMILES", "") or ""))
+        if smiles is None:
+            stats["skipped_smiles"] += 1
+            continue
+
+        activity_nm = (
+            config.BINARY_ACTIVE_NM if label == 1 else config.BINARY_INACTIVE_NM
+        )
+        record: dict[str, Any] = {col: "" for col in _OUTPUT_COLUMNS}
+        record["Ligand SMILES"] = smiles
+        record["Target Name"] = protein["name"]
+        record["Target Source Organism According to Curator or DataSource"] = protein[
+            "organism"
+        ]
+        record["Other (nM)"] = f"{activity_nm:.6g}"
+        record["Activity Label"] = str(label)
+        record["BindingDB Target Chain Sequence 1"] = protein["sequence"]
+        out.append(record)
+
+    if binary_skip > 0:
+        if binary_skip >= len(out):
+            binary_skip -= len(out)
+            out = []
+        else:
+            out = out[binary_skip:]
+            binary_skip = 0
+
+    if limit is not None and rows_written + len(out) > limit:
+        out = out[: limit - rows_written]
+
+    for record in out:
+        seen_ligands.add(record["Ligand SMILES"])
+        seen_proteins.add(record["BindingDB Target Chain Sequence 1"])
+    stats["written"] += len(out)
+    stats["written_binary"] += len(out)
+
+    return out, rows_written + len(out), binary_skip
+
+
+def _open_papyrus_reader(
+    version: str,
+    plusplus: bool,
+    papyrus_root: Optional[str],
+    chunk_size: int,
+) -> Any:
+    """Open a chunked Papyrus activity reader.
+
+    Args:
+        version: Papyrus version string.
+        plusplus: If ``True``, read Papyrus++.
+        papyrus_root: Optional data directory override.
+        chunk_size: Rows per chunk.
+
+    Returns:
+        A pandas ``TextFileReader`` / chunk iterator.
+    """
+    from papyrus_scripts import read_papyrus
+
+    return read_papyrus(
+        is3d=False,
+        version=version,
+        plusplus=plusplus,
+        chunksize=chunk_size,
+        source_path=papyrus_root,
+    )
+
+
 def iter_filtered_chunks(
     version: str,
     plusplus: bool,
@@ -591,7 +765,7 @@ def iter_filtered_chunks(
     min_quality: str,
     verbose: bool,
 ) -> Iterator[pd.DataFrame]:
-    """Yield filtered Papyrus activity chunks ready for conversion.
+    """Yield filtered quantitative Papyrus activity chunks for conversion.
 
     Filters are applied directly per raw chunk instead of chaining
     ``papyrus_scripts.preprocess.keep_quality`` and ``keep_type`` generators,
@@ -607,14 +781,12 @@ def iter_filtered_chunks(
         verbose: If ``True``, print progress notes.
 
     Yields:
-        Filtered pandas DataFrames.
+        Filtered pandas DataFrames of exact quantitative assay rows.
     """
-    from papyrus_scripts import read_papyrus
-
     if verbose:
         label = "Papyrus++" if plusplus else "full Papyrus"
         print(
-            f"[papyrus] streaming {label} version={version!r} "
+            f"[papyrus] streaming quantitative {label} version={version!r} "
             f"chunk_size={chunk_size}",
             flush=True,
         )
@@ -624,13 +796,7 @@ def iter_filtered_chunks(
         if expected is not None:
             print(f"[papyrus] expected raw rows in source file: {expected:,}", flush=True)
 
-    reader = read_papyrus(
-        is3d=False,
-        version=version,
-        plusplus=plusplus,
-        chunksize=chunk_size,
-        source_path=papyrus_root,
-    )
+    reader = _open_papyrus_reader(version, plusplus, papyrus_root, chunk_size)
     raw_rows = 0
     raw_idx = 0
     for raw_idx, chunk in enumerate(reader, start=1):
@@ -639,29 +805,99 @@ def iter_filtered_chunks(
         raw_rows += len(chunk)
         if not plusplus:
             chunk = _filter_quality(chunk, min_quality)
+        # Skip class-labeled rows in the quantitative pass (handled separately).
+        if "Activity_class" in chunk.columns:
+            chunk = chunk[chunk["Activity_class"].isna()]
         chunk = _filter_activity_types(chunk)
         chunk = _filter_exact_relation(chunk)
         if chunk.empty:
             if verbose and raw_idx % 10 == 0:
                 print(
-                    f"[papyrus] read {raw_idx} raw chunks ({raw_rows:,} rows)...",
+                    f"[papyrus] quant: read {raw_idx} raw chunks ({raw_rows:,} rows)...",
                     flush=True,
                 )
             continue
         if verbose and raw_idx % 10 == 0:
             print(
-                f"[papyrus] read {raw_idx} raw chunks ({raw_rows:,} rows), "
+                f"[papyrus] quant: read {raw_idx} raw chunks ({raw_rows:,} rows), "
                 f"latest filtered chunk={len(chunk):,}",
                 flush=True,
             )
         yield chunk
 
     if verbose:
-        print(f"[papyrus] finished reading {raw_idx} raw chunks ({raw_rows:,} rows)", flush=True)
+        print(
+            f"[papyrus] finished quantitative pass ({raw_idx} raw chunks, "
+            f"{raw_rows:,} rows)",
+            flush=True,
+        )
+
+
+def iter_binary_chunks(
+    version: str,
+    papyrus_root: Optional[str],
+    chunk_size: int,
+    min_quality: str,
+    verbose: bool,
+) -> Iterator[pd.DataFrame]:
+    """Yield Papyrus chunks that carry ``Activity_class`` binary labels.
+
+    Args:
+        version: Papyrus version string.
+        papyrus_root: Optional Papyrus data directory override.
+        chunk_size: Rows per streaming chunk.
+        min_quality: Minimum quality tier (``high`` / ``medium`` / ``low``).
+        verbose: If ``True``, print progress notes.
+
+    Yields:
+        DataFrames containing only rows with a non-null ``Activity_class``.
+    """
+    if verbose:
+        print(
+            f"[papyrus] streaming Activity_class rows version={version!r} "
+            f"chunk_size={chunk_size}",
+            flush=True,
+        )
+
+    reader = _open_papyrus_reader(version, plusplus=False, papyrus_root=papyrus_root, chunk_size=chunk_size)
+    raw_rows = 0
+    raw_idx = 0
+    for raw_idx, chunk in enumerate(reader, start=1):
+        if not isinstance(chunk, pd.DataFrame) or chunk.empty:
+            continue
+        raw_rows += len(chunk)
+        chunk = _filter_quality(chunk, min_quality)
+        if "Activity_class" not in chunk.columns:
+            continue
+        chunk = chunk[chunk["Activity_class"].notna()]
+        if chunk.empty:
+            if verbose and raw_idx % 20 == 0:
+                print(
+                    f"[papyrus] binary: read {raw_idx} raw chunks ({raw_rows:,} rows)...",
+                    flush=True,
+                )
+            continue
+        if verbose and raw_idx % 20 == 0:
+            print(
+                f"[papyrus] binary: read {raw_idx} raw chunks ({raw_rows:,} rows), "
+                f"latest class chunk={len(chunk):,}",
+                flush=True,
+            )
+        yield chunk
+
+    if verbose:
+        print(
+            f"[papyrus] finished binary pass ({raw_idx} raw chunks, {raw_rows:,} rows)",
+            flush=True,
+        )
 
 
 def run_build(args: argparse.Namespace) -> str:
     """Download (optional), convert, and write the prepared Papyrus CSV.
+
+    Writes quantitative assay rows first. When ``--include-binary`` is set,
+    streams a second pass over ``Activity_class`` rows into the same file.
+    ``--limit`` caps total written rows across both phases.
 
     Args:
         args: Parsed CLI arguments.
@@ -672,8 +908,16 @@ def run_build(args: argparse.Namespace) -> str:
     _require_papyrus()
     verbose = not args.quiet
     plusplus = args.subset == "plusplus"
-    output = args.output or _default_output(args.subset)
+    include_binary = bool(getattr(args, "include_binary", False))
+    resume = bool(getattr(args, "resume", False))
+    if include_binary and plusplus:
+        raise SystemExit("--include-binary requires --subset full (Papyrus++ has no Activity_class).")
+    if resume and not include_binary:
+        raise SystemExit("--resume requires --include-binary.")
+    output = args.output or _default_output(args.subset, include_binary=include_binary)
     os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
+    if resume and not os.path.isfile(output):
+        raise SystemExit(f"--resume requested but output file does not exist: {output}")
 
     resolved_version = ensure_downloaded(
         version=args.version,
@@ -687,59 +931,143 @@ def run_build(args: argparse.Namespace) -> str:
 
     stats: dict[str, int] = {
         "written": 0,
+        "written_binary": 0,
         "skipped_relation": 0,
         "skipped_activity": 0,
         "skipped_assay": 0,
         "skipped_sequence": 0,
         "skipped_smiles": 0,
+        "skipped_binary_class": 0,
     }
     seen_ligands: set[str] = set()
     seen_proteins: set[str] = set()
     rows_written = 0
+    binary_skip = 0
     expected_raw = _expected_raw_rows(resolved_version, plusplus, args.papyrus_root)
 
-    with open(output, "w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=_OUTPUT_COLUMNS, extrasaction="ignore")
-        writer.writeheader()
-        for chunk in iter_filtered_chunks(
-            version=resolved_version,
-            plusplus=plusplus,
-            papyrus_root=args.papyrus_root,
-            chunk_size=args.chunk_size,
-            min_quality=args.min_quality,
-            verbose=verbose,
-        ):
-            rows, rows_written = convert_chunk(
-                chunk,
-                proteins,
-                stats,
-                seen_ligands,
-                seen_proteins,
-                args.limit,
-                rows_written,
+    if resume:
+        if verbose:
+            print(f"[papyrus] resuming from existing output: {output}", flush=True)
+        quant_existing, binary_existing = _count_existing_rows(output)
+        if quant_existing == 0:
+            raise SystemExit(
+                "--resume requires an existing CSV with quantitative rows "
+                "(Activity Label empty)."
             )
-            if rows:
-                writer.writerows(rows)
-                handle.flush()
-            if args.limit is not None and rows_written >= args.limit:
-                if verbose:
-                    print(f"[papyrus] reached --limit {args.limit}", flush=True)
-                break
+        rows_written = quant_existing + binary_existing
+        binary_skip = binary_existing
+        stats["written"] = quant_existing
+        stats["written_binary"] = binary_existing
+        if verbose:
+            print(
+                f"[papyrus] found {quant_existing:,} quantitative and "
+                f"{binary_existing:,} binary rows; skipping quant pass",
+                flush=True,
+            )
+        if args.limit is not None and rows_written >= args.limit:
+            if verbose:
+                print(
+                    f"[papyrus] existing row count already meets --limit {args.limit}; "
+                    "nothing to do",
+                    flush=True,
+                )
+            return output
+
+    write_mode = "a" if resume else "w"
+    with open(output, write_mode, newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_OUTPUT_COLUMNS, extrasaction="ignore")
+        if not resume:
+            writer.writeheader()
+        if not resume:
+            for chunk in iter_filtered_chunks(
+                version=resolved_version,
+                plusplus=plusplus,
+                papyrus_root=args.papyrus_root,
+                chunk_size=args.chunk_size,
+                min_quality=args.min_quality,
+                verbose=verbose,
+            ):
+                rows, rows_written = convert_chunk(
+                    chunk,
+                    proteins,
+                    stats,
+                    seen_ligands,
+                    seen_proteins,
+                    args.limit,
+                    rows_written,
+                )
+                if rows:
+                    writer.writerows(rows)
+                    handle.flush()
+                if args.limit is not None and rows_written >= args.limit:
+                    if verbose:
+                        print(
+                            f"[papyrus] reached --limit {args.limit} during quantitative pass",
+                            flush=True,
+                        )
+                    break
+
+        if include_binary and (args.limit is None or rows_written < args.limit):
+            if verbose:
+                if resume:
+                    print(
+                        f"[papyrus] resuming Activity_class pass "
+                        f"(skip {binary_skip:,} binary rows)",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[papyrus] quantitative rows written so far: {rows_written:,}; "
+                        "starting Activity_class pass",
+                        flush=True,
+                    )
+            for chunk in iter_binary_chunks(
+                version=resolved_version,
+                papyrus_root=args.papyrus_root,
+                chunk_size=args.chunk_size,
+                min_quality=args.min_quality,
+                verbose=verbose,
+            ):
+                rows, rows_written, binary_skip = convert_binary_chunk(
+                    chunk,
+                    proteins,
+                    stats,
+                    seen_ligands,
+                    seen_proteins,
+                    args.limit,
+                    rows_written,
+                    binary_skip=binary_skip,
+                )
+                if rows:
+                    writer.writerows(rows)
+                    handle.flush()
+                if args.limit is not None and rows_written >= args.limit:
+                    if verbose:
+                        print(
+                            f"[papyrus] reached --limit {args.limit} during binary pass",
+                            flush=True,
+                        )
+                    break
 
     if verbose:
         print(
-            f"\n[papyrus] subset={args.subset} wrote {stats['written']} rows -> {output}\n"
+            f"\n[papyrus] subset={args.subset} include_binary={include_binary} "
+            f"wrote {stats['written']} rows "
+            f"(binary={stats['written_binary']}) -> {output}\n"
             f"[papyrus] unique ligands={len(seen_ligands)}  "
             f"unique proteins={len(seen_proteins)}\n"
             f"[papyrus] skipped: relation={stats['skipped_relation']}  "
             f"activity={stats['skipped_activity']}  assay={stats['skipped_assay']}  "
-            f"sequence={stats['skipped_sequence']}  smiles={stats['skipped_smiles']}",
+            f"sequence={stats['skipped_sequence']}  smiles={stats['skipped_smiles']}  "
+            f"binary_class={stats['skipped_binary_class']}",
             flush=True,
         )
         if (
             not plusplus
+            and not include_binary
+            and args.limit is None
             and expected_raw is not None
-            and stats["written"] < expected_raw * 0.05
+            and stats["written"] < expected_raw * 0.01
         ):
             print(
                 "[papyrus] warning: output row count is far below the raw Papyrus 2D "
@@ -785,8 +1113,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--output",
         default=None,
         help=(
-            "Output CSV path (default: data/train/Papyrus_pp_prepared.csv or "
-            "Papyrus_full_prepared.csv)."
+            "Output CSV path (default: Papyrus_pp_prepared.csv, "
+            "Papyrus_full_prepared.csv, or Papyrus_full_binary_prepared.csv "
+            "when --include-binary is set)."
+        ),
+    )
+    p.add_argument(
+        "--include-binary",
+        action="store_true",
+        help=(
+            "For --subset full: after quantitative rows, also append "
+            "Activity_class binary rows (Other assay + Activity Label). "
+            "Reuse --limit to cap total size (write quant first)."
+        ),
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "With --include-binary: append to an existing partial output CSV, "
+            "skipping the quantitative pass and continuing the Activity_class "
+            "pass from the row count already on disk."
         ),
     )
     p.add_argument(
@@ -824,7 +1171,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--limit",
         type=int,
         default=None,
-        help="Cap on output rows (smoke tests).",
+        help=(
+            "Cap on total output rows (smoke tests, or binary subsampling: "
+            "quant is written first, then Activity_class rows fill the remainder)."
+        ),
     )
     p.add_argument("--quiet", action="store_true", help="Reduce progress output.")
     return p

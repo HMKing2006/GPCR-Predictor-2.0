@@ -107,6 +107,7 @@ def run_grid_search(args: argparse.Namespace) -> str:
         limit=args.limit,
         verbose=verbose,
         rebuild=args.rebuild_features,
+        activity_threshold_nm=args.activity_threshold_nm,
     )
     groups = dataset.load_groups()
     split = train_val_test_split(groups, dataset.signature, seed=args.seed, verbose=verbose)
@@ -175,6 +176,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=config.RANDOM_SEED)
     p.add_argument("--output", default=None, help="Output joblib path for the best model.")
     p.add_argument("--rebuild-features", action="store_true")
+    p.add_argument(
+        "--activity-threshold-nm",
+        type=float,
+        default=config.ACTIVITY_THRESHOLD_NM,
+        help=(
+            "Binder cutoff in nM for quantitative rows (default: 50). "
+            "Papyrus Activity_class rows keep their explicit Activity Label."
+        ),
+    )
     p.add_argument(
         "--include-rf",
         action="store_true",

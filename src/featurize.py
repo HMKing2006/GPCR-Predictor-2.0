@@ -25,7 +25,7 @@ from typing import Optional
 import numpy as np
 
 import config
-from src.data_prep import iter_prepared_rows
+from src.data_prep import binarize_pactivity, iter_prepared_rows
 from src.embeddings import HFEmbedder, protein_embedder
 from src.ligand_repr import CompositeLigandFeaturizer, canonical_ligand_repr, parse_ligand_repr
 from src.lmdb_cache import EmbeddingCache
@@ -47,6 +47,10 @@ class FeatureDataset:
         protein_dim: Protein embedding dimensionality.
         ligand_dim: Ligand embedding dimensionality.
         signature: Content signature used for split reuse.
+        labels_are_binary: If ``True``, ``y.npy`` already holds ``0``/``1``
+            binder labels and should not be re-binarized at train time.
+        activity_threshold_nm: Activity cutoff in nM used when binarizing
+            quantitative rows during feature construction.
     """
 
     directory: str
@@ -55,6 +59,8 @@ class FeatureDataset:
     protein_dim: int
     ligand_dim: int
     signature: str
+    labels_are_binary: bool = False
+    activity_threshold_nm: float = config.ACTIVITY_THRESHOLD_NM
 
     @property
     def x_path(self) -> str:
@@ -176,7 +182,13 @@ def assemble_matrix(
     return out
 
 
-def _signature(csv_path: str, limit: Optional[int], protein_model: str, ligand_model: str) -> str:
+def _signature(
+    csv_path: str,
+    limit: Optional[int],
+    protein_model: str,
+    ligand_model: str,
+    activity_threshold_nm: float,
+) -> str:
     """Compute a stable content signature for a dataset build.
 
     Args:
@@ -184,12 +196,16 @@ def _signature(csv_path: str, limit: Optional[int], protein_model: str, ligand_m
         limit: Row limit used (or ``None``).
         protein_model: Protein model identifier.
         ligand_model: Ligand representation spec (canonicalized before hashing).
+        activity_threshold_nm: Binder cutoff in nM for quantitative rows.
 
     Returns:
         A short hex digest identifying this configuration.
     """
     ligand_key = canonical_ligand_repr(ligand_model)
-    key = f"{os.path.basename(csv_path)}|{limit}|{protein_model}|{ligand_key}"
+    key = (
+        f"{os.path.basename(csv_path)}|{limit}|{protein_model}|{ligand_key}|"
+        f"{activity_threshold_nm:g}"
+    )
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 
@@ -233,6 +249,7 @@ def build_features(
     verbose: bool = True,
     rebuild: bool = False,
     device: object = None,
+    activity_threshold_nm: float = config.ACTIVITY_THRESHOLD_NM,
 ) -> FeatureDataset:
     """Build (or reuse) the memmapped feature matrix for a dataset.
 
@@ -245,11 +262,13 @@ def build_features(
         verbose: If ``True``, print progress.
         rebuild: If ``True``, rebuild even when a cached build exists.
         device: Optional torch device for the embedders.
+        activity_threshold_nm: Binder cutoff in nM for quantitative rows without
+            an explicit ``Activity Label``.
 
     Returns:
         A :class:`FeatureDataset` describing the on-disk matrix.
     """
-    signature = _signature(csv_path, limit, protein_model, ligand_model)
+    signature = _signature(csv_path, limit, protein_model, ligand_model, activity_threshold_nm)
     directory = os.path.join(config.FEATURES_DIR, signature)
     meta_path = os.path.join(directory, "meta.json")
     if os.path.exists(meta_path) and not rebuild:
@@ -264,6 +283,10 @@ def build_features(
             protein_dim=meta["protein_dim"],
             ligand_dim=meta["ligand_dim"],
             signature=meta["signature"],
+            labels_are_binary=bool(meta.get("labels_are_binary", False)),
+            activity_threshold_nm=float(
+                meta.get("activity_threshold_nm", config.ACTIVITY_THRESHOLD_NM)
+            ),
         )
 
     os.makedirs(directory, exist_ok=True)
@@ -285,7 +308,17 @@ def build_features(
         assay_ids.append(_ASSAY_TO_INDEX[row.assay_type])
         phs.append(row.ph)
         temps.append(row.temp)
-        ys.append(row.pactivity)
+        if row.activity_label is not None:
+            ys.append(float(row.activity_label))
+        else:
+            ys.append(
+                float(
+                    binarize_pactivity(
+                        np.asarray([row.pactivity]),
+                        threshold_nm=activity_threshold_nm,
+                    )[0]
+                )
+            )
         if verbose and kept % _PROGRESS_EVERY == 0:
             print(
                 f"[features] pass 1: {kept} rows kept "
@@ -368,6 +401,9 @@ def build_features(
         "signature": signature,
         "ligand_model": ligand_featurizer.canonical_spec,
         "ligand_component_dims": ligand_featurizer.component_dims,
+        "labels_are_binary": True,
+        "activity_threshold_nm": activity_threshold_nm,
+        "assay_types": list(config.ASSAY_TYPES),
     }
     with open(meta_path, "w") as handle:
         json.dump(meta, handle, indent=2)
@@ -381,4 +417,6 @@ def build_features(
         protein_dim=protein_dim,
         ligand_dim=ligand_dim,
         signature=signature,
+        labels_are_binary=True,
+        activity_threshold_nm=activity_threshold_nm,
     )
