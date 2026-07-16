@@ -111,11 +111,12 @@ Useful flags:
 | `--chunk-size 500000` | Rows per streaming chunk |
 | `--output PATH` | Override output Parquet path |
 | `--limit N` | Cap total output rows (quant written before binary) |
-| `--resume` | Continue a partial `--include-binary` Parquet build |
+| `--resume` | Resume the binary pass from an existing valid prepared Parquet |
 
 Train or grid-search on Papyrus by passing `--csv` (the flag accepts Parquet
-paths). **Always use `--rebuild-features`** after changing assay-context
-settings, assay vocabulary, or switching prepared files:
+paths). Use `--rebuild-features` after changing row-level settings such as the
+activity cutoff or assay context. Switching prepared files selects another
+readable dataset cache directory automatically:
 
 ```bash
 python train.py --csv data/train/Papyrus_pp_prepared.parquet --rebuild-features
@@ -123,8 +124,10 @@ python grid_search.py --csv data/train/Papyrus_full_prepared.parquet --rebuild-f
 python grid_search.py --csv data/train/Papyrus_full_binary_prepared.parquet --rebuild-features
 ```
 
-Each prepared file + assay-context setting gets its own feature-cache signature
-and splits under `cache/features/` and `data/splits/`.
+Dataset caches are grouped under
+`cache/datasets/<prepared-file-stem>/`. The row layout is validated against the
+resolved source path, file size, modification time, cutoff, limit, and assay
+context before reuse.
 
 ## Ligand representations
 
@@ -142,21 +145,59 @@ token, or a **comma-separated combination** (concatenated in that order):
 Examples:
 
 ```bash
-# Fingerprints only
-python train.py --ligand-model morgan --rebuild-features
+# Fingerprints only (adds morgan.npy without deleting existing embeddings)
+python train.py --ligand-model morgan
 
 # RDKit-only stack
-python train.py --ligand-model morgan,avalon,descriptors --rebuild-features
+python train.py --ligand-model morgan,avalon,descriptors
 
 # Hybrid: Morgan + MoLFormer
-python train.py --ligand-model morgan,molformer --rebuild-features
+python train.py --ligand-model morgan,molformer
 
 # Explicit HF id (default when --ligand-model is omitted)
 python train.py --ligand-model ibm-research/MoLFormer-XL-both-10pct
 ```
 
 Each component is cached independently under `cache/ligand__*.lmdb`, so adding
-MoLFormer to an existing Morgan cache reuses the Morgan store.
+MoLFormer to an existing Morgan cache reuses the Morgan store. Dataset-local
+matrices are also component-specific, so combined representations concatenate
+the selected matrices at runtime rather than storing another combined copy.
+
+## Feature storage
+
+The expanded per-activity-row `X.dat` and `split_*.dat` files are no longer
+created. Each prepared dataset has one browseable snapshot:
+
+```text
+cache/datasets/Papyrus_full_binary_prepared/
+  features/
+    protein_ids.npy
+    ligand_ids.npy
+    activity_labels.npy
+    scaffold_groups.npy
+    years.npy
+    protein_embeddings/
+      ESM650.npy
+    ligand_embeddings/
+      MolFormerXL.npy
+      morgan.npy
+    meta.json
+  splits/
+    double_cold__test20pct__seed42.npz
+```
+
+The embedding `.npy` files contain one vector per unique entity and remain
+memory-mappable. `FeatureView` gathers only the current MLP minibatch or random
+forest shard into RAM. Disk use therefore scales primarily with unique proteins
+and ligands, not activity rows. For 10 million rows with roughly one million
+unique 768-dimensional ligands, the ligand snapshot is about 2.9 GiB instead
+of roughly 76 GiB for a 2048-dimensional `X.dat`; no additional 61 GiB 80%
+training split copy is written.
+
+The global LMDB stores remain the durable, reusable source of embeddings for
+other datasets and prediction. Existing LMDBs require no migration. After a
+successful rebuild, obsolete `cache/features/`, `data/splits/`, `X.dat`, and
+`split_*.dat` artifacts may be deleted manually.
 
 ## Feature vector
 
@@ -229,8 +270,9 @@ python train.py --limit 5000
 After training, accuracy, precision, recall, F1, AUROC, and AUPRC are printed,
 followed by **novelty breakouts** on the test set (known/unknown protein,
 known/unknown scaffold, and the 2×2 cells relative to train). The model is
-saved to `models/` as a joblib file. Splits are saved under `data/splits/` and
-reused automatically when the dataset and seed match.
+saved to `models/` as a joblib file. Splits are saved under the matching
+`cache/datasets/<stem>/splits/` directory and reused only when their embedded
+row-layout signature and seed match.
 
 MLP early stopping uses a **double-cold holdout** carved from the training split
 (~5% of train rows; no protein or scaffold overlap with the fit set), including
@@ -297,7 +339,7 @@ src/data_prep.py     Streaming cleaning + label preparation (CSV / Parquet).
 src/lmdb_cache.py    Embedding cache with model-derived DB names.
 src/embeddings.py    ESM-2 and MoLFormer-XL embedders.
 src/ligand_repr.py   Fingerprints, descriptors, composite ligand reps.
-src/featurize.py     Memmapped feature-matrix assembly + scaffolds/years.
+src/featurize.py     Compact feature snapshots + on-demand FeatureView.
 src/splits.py        Double-cold and percentage time splits with save/reuse.
 src/models.py        Warm-start RF + torch MLP classifiers.
 src/metrics.py       Classification metrics + novelty breakouts.

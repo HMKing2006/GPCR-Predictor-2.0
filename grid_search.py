@@ -203,7 +203,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Test fraction (double-cold row target or temporal dated-row target).",
     )
     p.add_argument("--output", default=None, help="Output joblib path for the best model.")
-    p.add_argument("--rebuild-features", action="store_true")
+    p.add_argument(
+        "--rebuild-features",
+        action="store_true",
+        help=(
+            "Replace this dataset's row snapshot and local embedding matrices "
+            "(global LMDB embeddings are retained)."
+        ),
+    )
     p.add_argument(
         "--activity-threshold-nm",
         type=float,

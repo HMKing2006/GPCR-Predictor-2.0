@@ -1,6 +1,6 @@
 """Train a single 50 nM binder / non-binder classifier.
 
-Builds (or reuses) the cached feature matrix, applies an 80/20 double-cold
+Builds (or reuses) a compact feature snapshot, applies an 80/20 double-cold
 (protein + Murcko scaffold) split by default (or a percentage-based publication
 year time split with ``--split-mode time``), trains the requested model,
 prints classification metrics and novelty breakouts on the held-out test set,
@@ -18,7 +18,7 @@ import numpy as np
 
 import config
 from src.data_prep import binarize_pactivity
-from src.featurize import FeatureDataset, build_features, subset_to_memmap
+from src.featurize import FeatureDataset, build_features
 from src.ligand_repr import canonical_ligand_repr
 from src.metrics import print_breakdowns, print_metrics
 from src.models import BaseRegressor, build_model
@@ -71,7 +71,7 @@ def fit_on_indices(
     verbose: bool = True,
     tag: str = "train",
 ) -> BaseRegressor:
-    """Materialize the training rows and fit a model on them.
+    """Fit a model through an on-demand view of the selected training rows.
 
     Labels from the feature cache are used as binder classes when
     ``dataset.labels_are_binary`` is set (default after rebuild); otherwise
@@ -86,13 +86,13 @@ def fit_on_indices(
         ligand_model: Ligand embedding model id (stored in metadata).
         seed: Random seed.
         verbose: If ``True``, print progress.
-        tag: Filename tag for the temporary split memmap.
+        tag: Legacy progress tag retained for caller compatibility.
 
     Returns:
         The fitted model with populated ``metadata``.
     """
-    tmp_path = os.path.join(dataset.directory, f"split_{tag}.dat")
-    X_train = subset_to_memmap(dataset, train_idx, tmp_path)
+    del tag
+    X_train = dataset.feature_view(train_idx)
     y_raw = dataset.load_y()[train_idx]
     y_train = (
         y_raw
@@ -114,6 +114,11 @@ def fit_on_indices(
         "hyperparams": hyperparams,
         "activity_threshold_nm": dataset.activity_threshold_nm,
         "include_assay_context": dataset.include_assay_context,
+        "feature_storage_version": "id_gather_v1",
+        "feature_signature": dataset.signature,
+        "feature_directory": dataset.directory,
+        "protein_embedding_alias": dataset.protein_alias,
+        "ligand_embedding_aliases": list(dataset.ligand_aliases),
         "task": "classification",
     }
     if verbose:
@@ -124,7 +129,7 @@ def fit_on_indices(
         )
     fit_kwargs: dict[str, Any] = {"verbose": verbose}
     if model_type == "mlp":
-        # Align protein/scaffold ids with the materialized train memmap for ES.
+        # Align protein/scaffold ids with the selected FeatureView for ES.
         fit_kwargs["groups"] = dataset.load_groups()[train_idx]
         fit_kwargs["scaffold_groups"] = dataset.load_scaffold_groups()[train_idx]
     model.fit(X_train, y_train, **fit_kwargs)
@@ -141,7 +146,7 @@ def evaluate_on_indices(
     tag: str = "eval",
     train_idx: Optional[np.ndarray] = None,
 ) -> dict[str, float]:
-    """Evaluate a fitted model on a subset of rows.
+    """Evaluate a fitted model through an on-demand row view.
 
     Args:
         model: A fitted model.
@@ -149,7 +154,7 @@ def evaluate_on_indices(
         idx: Row indices to evaluate on.
         label: Label used in the printed metrics line.
         verbose: If ``True``, print the metrics.
-        tag: Filename tag for the temporary split memmap.
+        tag: Legacy progress tag retained for caller compatibility.
         train_idx: Optional training indices used to compute known/unknown
             protein and scaffold breakouts relative to train.
 
@@ -157,8 +162,8 @@ def evaluate_on_indices(
         The metric mapping (``accuracy``, ``precision``, ``recall``, ``f1``,
         ``auroc``, ``auprc``).
     """
-    tmp_path = os.path.join(dataset.directory, f"split_{tag}.dat")
-    X_eval = subset_to_memmap(dataset, idx, tmp_path)
+    del tag
+    X_eval = dataset.feature_view(idx)
     y_raw = dataset.load_y()[idx]
     y_eval = (
         y_raw
@@ -230,6 +235,7 @@ def _resolve_split(
                 test_fraction=float(args.test_fraction),
                 include_val=False,
                 seed=args.seed,
+                splits_dir=dataset.split_directory,
                 verbose=verbose,
             )
         return get_or_create_time_split(
@@ -239,6 +245,7 @@ def _resolve_split(
             test_fraction=float(args.test_fraction),
             include_val=True,
             seed=args.seed,
+            splits_dir=dataset.split_directory,
             verbose=verbose,
         )
 
@@ -254,6 +261,7 @@ def _resolve_split(
             val_fraction=float(args.val_fraction),
             test_fraction=float(args.test_fraction),
             seed=args.seed,
+            splits_dir=dataset.split_directory,
             verbose=verbose,
         )
     return train_test_split(
@@ -262,6 +270,7 @@ def _resolve_split(
         dataset.signature,
         test_fraction=float(args.test_fraction),
         seed=args.seed,
+        splits_dir=dataset.split_directory,
         verbose=verbose,
     )
 
@@ -358,7 +367,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--seed", type=int, default=config.RANDOM_SEED)
     p.add_argument("--output", default=None, help="Output joblib path.")
-    p.add_argument("--rebuild-features", action="store_true", help="Force feature rebuild.")
+    p.add_argument(
+        "--rebuild-features",
+        action="store_true",
+        help=(
+            "Replace this dataset's row snapshot and local embedding matrices "
+            "(global LMDB embeddings are retained)."
+        ),
+    )
     p.add_argument(
         "--activity-threshold-nm",
         type=float,

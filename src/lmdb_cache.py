@@ -80,6 +80,7 @@ class EmbeddingCache:
         cache_dir: str = config.CACHE_DIR,
         map_size: int = _DEFAULT_MAP_SIZE,
         readonly: bool = False,
+        expected_dim: Optional[int] = None,
     ) -> None:
         """Open (or create) an LMDB store for one modality/model pair.
 
@@ -90,11 +91,17 @@ class EmbeddingCache:
             map_size: Maximum size in bytes the store may grow to.
             readonly: If ``True``, open without write access (and without
                 creating the store when it is missing).
+            expected_dim: Optional vector length. Reads and writes with another
+                length raise ``ValueError`` instead of silently propagating a
+                corrupt or incompatible cache entry.
         """
         os.makedirs(cache_dir, exist_ok=True)
         self.path: str = cache_path(modality, model_id, cache_dir)
         self.modality: str = modality
         self.model_id: str = model_id
+        self.expected_dim: Optional[int] = (
+            None if expected_dim is None else int(expected_dim)
+        )
         self._env: lmdb.Environment = lmdb.open(
             self.path,
             map_size=map_size,
@@ -157,7 +164,7 @@ class EmbeddingCache:
             raw = txn.get(_key(entity))
         if raw is None:
             return None
-        return np.frombuffer(raw, dtype=np.float32)
+        return self._decode(raw, entity)
 
     def get_many(self, entities: Iterable[str]) -> dict[str, np.ndarray]:
         """Fetch several embeddings in one read transaction.
@@ -174,8 +181,36 @@ class EmbeddingCache:
             for entity in entities:
                 raw = txn.get(_key(entity))
                 if raw is not None:
-                    result[entity] = np.frombuffer(raw, dtype=np.float32)
+                    result[entity] = self._decode(raw, entity)
         return result
+
+    def _decode(self, raw: bytes, entity: str) -> np.ndarray:
+        """Decode and validate one cached vector.
+
+        Args:
+            raw: Raw LMDB value bytes.
+            entity: Entity string used only to identify malformed entries.
+
+        Returns:
+            A read-only ``float32`` view over ``raw``.
+
+        Raises:
+            ValueError: If byte length is not valid float32 data or the vector
+                length differs from ``expected_dim``.
+        """
+        if len(raw) % np.dtype(np.float32).itemsize != 0:
+            raise ValueError(
+                f"Malformed {self.modality} cache entry for {_key(entity).hex()}: "
+                f"{len(raw)} bytes is not valid float32 data."
+            )
+        vector = np.frombuffer(raw, dtype=np.float32)
+        if self.expected_dim is not None and vector.size != self.expected_dim:
+            raise ValueError(
+                f"Incompatible {self.modality} cache entry for {_key(entity).hex()}: "
+                f"expected {self.expected_dim} values, found {vector.size} "
+                f"in {self.path}."
+            )
+        return vector
 
     def missing(self, entities: Iterable[str]) -> list[str]:
         """Return the entities that are not yet cached.
@@ -211,6 +246,16 @@ class EmbeddingCache:
         with self._env.begin(write=True) as txn:
             for entity, vec in vectors.items():
                 arr = np.asarray(vec, dtype=np.float32)
+                if arr.ndim != 1:
+                    raise ValueError(
+                        f"Embedding for {entity!r} must be one-dimensional; "
+                        f"got shape {arr.shape}."
+                    )
+                if self.expected_dim is not None and arr.size != self.expected_dim:
+                    raise ValueError(
+                        f"Embedding for {entity!r} has {arr.size} values; "
+                        f"expected {self.expected_dim}."
+                    )
                 txn.put(_key(entity), arr.tobytes(), overwrite=True)
 
     def __len__(self) -> int:

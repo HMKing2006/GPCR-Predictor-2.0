@@ -6,8 +6,8 @@ Modules:
     embeddings: MoLFormer-XL (ligand) and ESM-2 (protein) embedders.
     ligand_repr: Morgan/Avalon fingerprints, RDKit descriptors, and composite
         ligand representations.
-    featurize: Assemble memmapped feature matrices from cached embeddings.
-    splits: Cold-protein train/test/validation splitting with reuse.
+    featurize: Build compact snapshots and gather feature batches on demand.
+    splits: Double-cold and temporal splitting with validated reuse.
     models: Random-forest and MLP classifiers with a shared interface.
     metrics: Classification metric helpers.
     io_utils: Readers/writers for spreadsheet, SMILES, SDF and FASTA formats.

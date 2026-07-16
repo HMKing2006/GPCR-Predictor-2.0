@@ -425,6 +425,32 @@ def _copy_parquet_to_writer(source_path: str, writer: pq.ParquetWriter) -> int:
     return copied
 
 
+def _validate_parquet_output(path: str, expected_rows: int) -> None:
+    """Validate a completed prepared Parquet file before publication.
+
+    Args:
+        path: Temporary Parquet path.
+        expected_rows: Number of rows produced by the conversion.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If the schema or row count is unexpected.
+    """
+    parquet = pq.ParquetFile(path)
+    if parquet.metadata.num_rows != expected_rows:
+        raise ValueError(
+            f"Parquet validation failed for {path}: expected {expected_rows} rows, "
+            f"found {parquet.metadata.num_rows}."
+        )
+    if parquet.schema_arrow != _PARQUET_SCHEMA:
+        raise ValueError(
+            f"Parquet validation failed for {path}: schema does not match "
+            "the prepared-data schema."
+        )
+
+
 def pchembl_to_nm(pchembl: float) -> Optional[float]:
     """Convert a pChEMBL / pActivity value to activity in nM.
 
@@ -1093,12 +1119,14 @@ def run_build(args: argparse.Namespace) -> str:
                 )
             return output
 
-    # Resume rewrites via a temp file (Parquet cannot append in place).
-    write_path = f"{output}.__building__.parquet" if resume else output
-    if resume and os.path.exists(write_path):
+    # Every build publishes atomically; Parquet is invalid until its footer is
+    # written, so an interrupted writer must never target the final path.
+    write_path = f"{output}.__building__.parquet"
+    if os.path.exists(write_path):
         os.remove(write_path)
 
     writer = pq.ParquetWriter(write_path, _PARQUET_SCHEMA, compression="zstd")
+    completed = False
     try:
         if resume:
             if verbose:
@@ -1173,11 +1201,19 @@ def run_build(args: argparse.Namespace) -> str:
                             flush=True,
                         )
                     break
+        completed = True
     finally:
         writer.close()
+        if not completed and os.path.exists(write_path):
+            os.remove(write_path)
 
-    if resume:
+    try:
+        _validate_parquet_output(write_path, rows_written)
         os.replace(write_path, output)
+    except Exception:
+        if os.path.exists(write_path):
+            os.remove(write_path)
+        raise
 
     if verbose:
         print(

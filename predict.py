@@ -81,7 +81,9 @@ class Predictor:
             self.model.metadata.get("include_assay_context", True)
         )
         self.pemb = protein_embedder(self.protein_model)
-        self.pcache = EmbeddingCache("protein", self.protein_model)
+        self.pcache = EmbeddingCache(
+            "protein", self.protein_model, expected_dim=self.pemb.dim
+        )
         self.ligand_featurizer: CompositeLigandFeaturizer = parse_ligand_repr(self.ligand_model)
 
     def close(self) -> None:

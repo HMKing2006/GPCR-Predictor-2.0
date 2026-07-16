@@ -4,11 +4,11 @@ Two model families are provided:
 
 * :class:`RandomForestModel` - a scikit-learn ``RandomForestClassifier`` grown
   with ``warm_start=True``. Trees are added in batches, each batch fit on a
-  contiguous row-shard read from the (memmapped) training matrix, keeping peak
-  memory near a single shard plus the incremental tree batch rather than the
-  whole matrix and full forest at once.
+  gathered row shard, keeping peak memory near one shard plus the incremental
+  tree batch rather than the whole matrix and full forest at once.
 * :class:`MLPModel` - a small PyTorch multilayer perceptron trained with
-  minibatch SGD (Adam) streamed from the memmap, with input standardization.
+  minibatch SGD (Adam) gathered from an array-like feature view, with input
+  standardization.
 
 Both expose ``fit``, ``predict``, ``save`` and ``load`` and carry a ``metadata``
 dict (embedding model ids, dims) so prediction can reconstruct features
@@ -18,6 +18,7 @@ identically. ``predict`` returns positive-class probabilities in ``[0, 1]``.
 from __future__ import annotations
 
 import math
+import os
 from typing import Any, Optional
 
 import joblib
@@ -47,7 +48,7 @@ class BaseRegressor:
         """Initialize shared state (metadata carried into the saved file)."""
         self.metadata: dict[str, Any] = {}
 
-    def fit(self, X: np.ndarray, y: np.ndarray, verbose: bool = True) -> "BaseRegressor":
+    def fit(self, X: Any, y: np.ndarray, verbose: bool = True) -> "BaseRegressor":
         """Fit the model.
 
         Args:
@@ -63,7 +64,7 @@ class BaseRegressor:
         """
         raise NotImplementedError
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
+    def predict(self, X: Any) -> np.ndarray:
         """Predict positive-class probabilities for ``X``.
 
         Args:
@@ -97,10 +98,21 @@ class BaseRegressor:
         Returns:
             None.
         """
-        joblib.dump(
-            {"model_type": self.model_type, "state": self._state(), "metadata": self.metadata},
-            path,
-        )
+        payload = {
+            "model_type": self.model_type,
+            "state": self._state(),
+            "metadata": self.metadata,
+        }
+        temporary = f"{path}.tmp-{os.getpid()}"
+        try:
+            joblib.dump(payload, temporary)
+            verified = joblib.load(temporary)
+            if verified.get("model_type") != self.model_type:
+                raise ValueError(f"Model verification failed for {temporary}.")
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
 
 
 class RandomForestModel(BaseRegressor):
@@ -143,7 +155,7 @@ class RandomForestModel(BaseRegressor):
             random_state=self.seed,
         )
 
-    def fit(self, X: np.ndarray, y: np.ndarray, verbose: bool = True) -> "RandomForestModel":
+    def fit(self, X: Any, y: np.ndarray, verbose: bool = True) -> "RandomForestModel":
         """Grow the forest incrementally over rotating row shards.
 
         Args:
@@ -179,7 +191,7 @@ class RandomForestModel(BaseRegressor):
                 )
         return self
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
+    def predict(self, X: Any) -> np.ndarray:
         """Predict binder probabilities in row chunks to bound memory.
 
         Args:
@@ -298,7 +310,7 @@ class _MLP(nn.Module):
 
 
 class MLPModel(BaseRegressor):
-    """PyTorch MLP classifier trained with minibatch SGD from a memmap."""
+    """PyTorch MLP classifier trained from gathered minibatches."""
 
     model_type = "mlp"
 
@@ -372,7 +384,7 @@ class MLPModel(BaseRegressor):
         self.feature_mean: Optional[np.ndarray] = None
         self.feature_std: Optional[np.ndarray] = None
 
-    def _standardize_stats(self, X: np.ndarray, rows: Optional[np.ndarray] = None) -> None:
+    def _standardize_stats(self, X: Any, rows: Optional[np.ndarray] = None) -> None:
         """Compute per-feature mean and std over selected rows in chunks.
 
         Args:
@@ -400,7 +412,7 @@ class MLPModel(BaseRegressor):
         self.feature_mean = mean.astype(np.float32)
         self.feature_std = np.sqrt(var).astype(np.float32)
 
-    def _batch_tensor(self, X: np.ndarray, rows: np.ndarray) -> torch.Tensor:
+    def _batch_tensor(self, X: Any, rows: np.ndarray) -> torch.Tensor:
         """Gather and standardize a batch of rows as a device tensor.
 
         Args:
@@ -414,7 +426,7 @@ class MLPModel(BaseRegressor):
         batch = (batch - self.feature_mean) / self.feature_std
         return torch.from_numpy(batch).to(self.device)
 
-    def _predict_logits(self, X: np.ndarray, rows: np.ndarray) -> np.ndarray:
+    def _predict_logits(self, X: Any, rows: np.ndarray) -> np.ndarray:
         """Run the network on selected rows and return raw logits on CPU.
 
         Args:
@@ -434,7 +446,7 @@ class MLPModel(BaseRegressor):
                 chunks.append(logits.astype(np.float32, copy=False))
         return np.concatenate(chunks) if chunks else np.empty(0, dtype=np.float32)
 
-    def _eval_auroc(self, X: np.ndarray, rows: np.ndarray, y: np.ndarray) -> float:
+    def _eval_auroc(self, X: Any, rows: np.ndarray, y: np.ndarray) -> float:
         """Compute validation AUROC over a set of rows without tracking grads.
 
         Args:
@@ -451,7 +463,7 @@ class MLPModel(BaseRegressor):
 
     def fit(
         self,
-        X: np.ndarray,
+        X: Any,
         y: np.ndarray,
         verbose: bool = True,
         groups: Optional[np.ndarray] = None,
@@ -623,7 +635,7 @@ class MLPModel(BaseRegressor):
                     f"[mlp] restored best weights (val_auroc={best_auroc:.4f} @ epoch {best_epoch})"
                 )
         return self
-    def predict(self, X: np.ndarray) -> np.ndarray:
+    def predict(self, X: Any) -> np.ndarray:
         """Predict binder probabilities in chunks with the trained network.
 
         Args:

@@ -1,13 +1,13 @@
-"""Double-cold and cold-protein train/test/validation splitting with on-disk reuse.
+"""Dataset-scoped train/test/validation splitting with validated on-disk reuse.
 
 A *double-cold* split guarantees that train/val/test share neither proteins nor
 Murcko scaffolds: rows are partitioned by connected components of the
 protein–scaffold co-occurrence graph. A *cold protein* split (legacy helper)
 only enforces protein disjointness.
 
-Splits are cached under ``data/splits/`` keyed by the dataset signature, the
-split type and the random seed, so an identical configuration reuses the exact
-same partition on subsequent runs.
+Splits are cached under the dataset's ``cache/datasets/<stem>/splits`` folder.
+Filenames describe the strategy while embedded metadata binds each file to the
+exact row layout that it indexes.
 """
 
 from __future__ import annotations
@@ -177,7 +177,7 @@ def _split_path(signature: str, split_type: str, seed: int, splits_dir: str) -> 
     """Build the cache path for a saved split.
 
     Args:
-        signature: Dataset signature.
+        signature: Dataset signature (stored inside the file, not its name).
         split_type: Human-readable split label (e.g. ``"train_test"``).
         seed: Random seed used.
         splits_dir: Directory holding split files.
@@ -185,7 +185,45 @@ def _split_path(signature: str, split_type: str, seed: int, splits_dir: str) -> 
     Returns:
         The ``.npz`` path for this split configuration.
     """
-    return os.path.join(splits_dir, f"{signature}__{split_type}__seed{seed}.npz")
+    del signature
+    safe_type = split_type.replace("/", "_").replace(" ", "_")
+    return os.path.join(splits_dir, f"{safe_type}__seed{seed}.npz")
+
+
+def _validate_split(split: dict[str, np.ndarray], n_rows: int) -> dict[str, np.ndarray]:
+    """Validate and normalize a complete row partition.
+
+    Args:
+        split: Mapping from split names to index arrays.
+        n_rows: Number of rows in the indexed dataset.
+
+    Returns:
+        Mapping with sorted ``int64`` arrays.
+
+    Raises:
+        ValueError: If indices are malformed, duplicated, overlapping,
+            out-of-range, or do not cover every row exactly once.
+    """
+    normalized: dict[str, np.ndarray] = {}
+    seen = np.zeros(n_rows, dtype=np.uint8)
+    for name, values in split.items():
+        array = np.asarray(values)
+        if array.ndim != 1 or not np.issubdtype(array.dtype, np.integer):
+            raise ValueError(f"Split {name!r} must be a one-dimensional integer array.")
+        array = array.astype(np.int64, copy=False)
+        if array.size and (int(array.min()) < 0 or int(array.max()) >= n_rows):
+            raise ValueError(f"Split {name!r} contains indices outside 0..{n_rows - 1}.")
+        if np.unique(array).size != array.size:
+            raise ValueError(f"Split {name!r} contains duplicate indices.")
+        if array.size and np.any(seen[array]):
+            raise ValueError(f"Split {name!r} overlaps another split.")
+        seen[array] = 1
+        normalized[name] = np.sort(array)
+    if int(seen.sum()) != n_rows:
+        raise ValueError(
+            f"Split covers {int(seen.sum())} of {n_rows} dataset rows."
+        )
+    return normalized
 
 
 def save_split(
@@ -207,9 +245,20 @@ def save_split(
     Returns:
         The path the split was written to.
     """
+    n_rows = sum(int(np.asarray(values).size) for values in split.values())
+    normalized = _validate_split(split, n_rows)
     os.makedirs(splits_dir, exist_ok=True)
     path = _split_path(signature, split_type, seed, splits_dir)
-    np.savez(path, **split)
+    temporary = f"{path}.tmp-{os.getpid()}.npz"
+    np.savez(
+        temporary,
+        **normalized,
+        __signature__=np.asarray(signature),
+        __split_type__=np.asarray(split_type),
+        __seed__=np.asarray(seed, dtype=np.int64),
+        __n_rows__=np.asarray(n_rows, dtype=np.int64),
+    )
+    os.replace(temporary, path)
     return path
 
 
@@ -218,6 +267,7 @@ def load_split(
     split_type: str,
     seed: int = config.RANDOM_SEED,
     splits_dir: str = config.SPLITS_DIR,
+    n_rows: Optional[int] = None,
 ) -> Optional[dict[str, np.ndarray]]:
     """Load a previously saved split if present.
 
@@ -226,6 +276,7 @@ def load_split(
         split_type: Human-readable split label.
         seed: Random seed used.
         splits_dir: Directory to read from.
+        n_rows: Expected dataset row count. When omitted, use file metadata.
 
     Returns:
         The split mapping, or ``None`` if no cached split exists.
@@ -234,7 +285,24 @@ def load_split(
     if not os.path.exists(path):
         return None
     with np.load(path) as data:
-        return {name: data[name] for name in data.files}
+        if "__signature__" not in data.files:
+            return None
+        if str(data["__signature__"].item()) != signature:
+            return None
+        if str(data["__split_type__"].item()) != split_type:
+            return None
+        if int(data["__seed__"].item()) != seed:
+            return None
+        stored_n_rows = int(data["__n_rows__"].item())
+        expected_n_rows = stored_n_rows if n_rows is None else int(n_rows)
+        if stored_n_rows != expected_n_rows:
+            return None
+        split = {
+            name: data[name]
+            for name in data.files
+            if not name.startswith("__")
+        }
+    return _validate_split(split, expected_n_rows)
 
 
 def get_or_create_double_cold_split(
@@ -262,7 +330,9 @@ def get_or_create_double_cold_split(
     Returns:
         The split mapping from name to row-index array.
     """
-    existing = load_split(signature, split_type, seed, splits_dir)
+    existing = load_split(
+        signature, split_type, seed, splits_dir, n_rows=protein_groups.shape[0]
+    )
     if existing is not None:
         if verbose:
             sizes = ", ".join(f"{k}={len(v)}" for k, v in existing.items())
@@ -299,7 +369,9 @@ def get_or_create_split(
     Returns:
         The split mapping from name to row-index array.
     """
-    existing = load_split(signature, split_type, seed, splits_dir)
+    existing = load_split(
+        signature, split_type, seed, splits_dir, n_rows=groups.shape[0]
+    )
     if existing is not None:
         if verbose:
             sizes = ", ".join(f"{k}={len(v)}" for k, v in existing.items())
@@ -342,7 +414,7 @@ def train_test_split(
         scaffold_groups,
         fractions,
         signature,
-        "double_cold_train_test",
+        f"double_cold__test{100.0 * test_fraction:g}pct",
         seed,
         splits_dir,
         verbose,
@@ -384,7 +456,10 @@ def train_val_test_split(
         scaffold_groups,
         fractions,
         signature,
-        "double_cold_train_val_test",
+        (
+            f"double_cold__val{100.0 * val_fraction:g}pct"
+            f"__test{100.0 * test_fraction:g}pct"
+        ),
         seed,
         splits_dir,
         verbose,
@@ -516,10 +591,13 @@ def get_or_create_time_split(
         The split mapping.
     """
     split_type = (
-        f"time_vf{val_fraction:g}_tf{test_fraction:g}"
-        + ("" if include_val else "_noval")
+        f"time__val{100.0 * val_fraction:g}pct"
+        f"__test{100.0 * test_fraction:g}pct"
+        + ("" if include_val else "__val-merged")
     )
-    existing = load_split(signature, split_type, seed, splits_dir)
+    existing = load_split(
+        signature, split_type, seed, splits_dir, n_rows=years.shape[0]
+    )
     if existing is not None:
         if verbose:
             sizes = ", ".join(f"{k}={len(v)}" for k, v in existing.items())

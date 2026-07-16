@@ -474,7 +474,9 @@ class CompositeLigandFeaturizer:
         entities = list(dict.fromkeys(smiles))
         total_new = 0
         for component in self.components:
-            with EmbeddingCache("ligand", component.cache_id) as cache:
+            with EmbeddingCache(
+                "ligand", component.cache_id, expected_dim=component.dim
+            ) as cache:
                 total_new += component.ensure_cached(entities, cache, verbose=verbose)
         return total_new
 
@@ -491,7 +493,9 @@ class CompositeLigandFeaturizer:
             return np.zeros((0, self.dim), dtype=np.float32)
         blocks: list[np.ndarray] = []
         for component in self.components:
-            with EmbeddingCache("ligand", component.cache_id) as cache:
+            with EmbeddingCache(
+                "ligand", component.cache_id, expected_dim=component.dim
+            ) as cache:
                 blocks.append(component.vectors_for(smiles, cache))
         return np.concatenate(blocks, axis=1)
 

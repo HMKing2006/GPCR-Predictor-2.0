@@ -22,9 +22,11 @@ PAPYRUS_FULL_BINARY_TRAIN_CSV: Final[str] = os.path.join(
     DATA_DIR, "train", "Papyrus_full_binary_prepared.parquet"
 )
 CACHE_DIR: Final[str] = os.path.join(PROJECT_ROOT, "cache")
+# Legacy flat cache paths retained for callers of low-level split helpers.
 SPLITS_DIR: Final[str] = os.path.join(DATA_DIR, "splits")
 MODELS_DIR: Final[str] = os.path.join(PROJECT_ROOT, "models")
 FEATURES_DIR: Final[str] = os.path.join(CACHE_DIR, "features")
+DATASETS_CACHE_DIR: Final[str] = os.path.join(CACHE_DIR, "datasets")
 
 # --- Default embedding models ------------------------------------------------
 
