@@ -518,6 +518,14 @@ class MLPModel(BaseRegressor):
                 "train": 1.0 - self.es_val_fraction,
                 "es_val": self.es_val_fraction,
             }
+            min_es_rows = max(1, int(0.25 * self.es_val_fraction * n))
+
+            def _usable(split: dict[str, np.ndarray]) -> bool:
+                """Return True when fit/holdout sizes are non-empty and oriented."""
+                n_train = int(split["train"].shape[0])
+                n_val = int(split["es_val"].shape[0])
+                return n_train > 0 and n_val >= min_es_rows and n_train >= n_val
+
             if scaffold_groups is not None:
                 scaffold_arr = np.asarray(scaffold_groups)
                 if scaffold_arr.shape[0] != n:
@@ -528,13 +536,25 @@ class MLPModel(BaseRegressor):
                 es_split = double_cold_split(
                     groups_arr, scaffold_arr, fractions, seed=self.seed
                 )
-                es_kind = "double-cold"
+                if _usable(es_split):
+                    es_kind = "double-cold"
+                else:
+                    if verbose:
+                        print(
+                            "[mlp] double-cold ES holdout too small; "
+                            "falling back to cold-protein",
+                            flush=True,
+                        )
+                    es_split = cold_protein_split(
+                        groups_arr, fractions, seed=self.seed
+                    )
+                    es_kind = "cold-protein"
             else:
                 es_split = cold_protein_split(groups_arr, fractions, seed=self.seed)
                 es_kind = "cold-protein"
             train_rows = es_split["train"]
             val_rows = es_split["es_val"]
-            early_stopping = train_rows.shape[0] > 0 and val_rows.shape[0] > 0
+            early_stopping = _usable(es_split)
             if verbose and early_stopping:
                 n_train_prot = int(np.unique(groups_arr[train_rows]).shape[0])
                 n_val_prot = int(np.unique(groups_arr[val_rows]).shape[0])

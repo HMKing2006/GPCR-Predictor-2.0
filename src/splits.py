@@ -2,8 +2,8 @@
 
 A *double-cold* split guarantees that train/val/test share neither proteins nor
 Murcko scaffolds: rows are partitioned by connected components of the
-protein–scaffold co-occurrence graph. A *cold protein* split (legacy helper)
-only enforces protein disjointness.
+protein–scaffold co-occurrence graph. A *cold protein* split only enforces
+protein disjointness.
 
 Splits are cached under the dataset's ``cache/datasets/<stem>/splits`` folder.
 Filenames describe the strategy while embedded metadata binds each file to the
@@ -13,8 +13,7 @@ exact row layout that it indexes.
 from __future__ import annotations
 
 import os
-from collections import defaultdict, deque
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -29,96 +28,68 @@ def _assign_blocks_to_splits(
 ) -> dict[str, np.ndarray]:
     """Greedily assign atomic blocks to splits by target row fraction.
 
+    Each block is given to the split with the largest remaining row deficit.
+    Blocks are considered largest-first (ties broken by ``seed``) so a giant
+    connected component lands in the largest target split instead of overflowing
+    a small holdout.
+
     Args:
         block_ids: Integer array ``(n_rows,)`` giving each row's block id.
         block_sizes: Mapping from block id to number of rows in that block.
-        fractions: Mapping from split name to target fraction of rows. The
-            fractions should sum to 1.0; the first-listed split absorbs any
-            rounding remainder.
-        seed: Random seed controlling the block shuffle.
+        fractions: Mapping from split name to target fraction of rows. Fractions
+            should sum to 1.0.
+        seed: Random seed controlling tie-breaking among equal-sized blocks.
 
     Returns:
         A mapping from split name to a sorted ``int64`` array of row indices.
     """
-    rng = np.random.default_rng(seed)
-    unique_blocks = np.asarray(sorted(block_sizes), dtype=np.int64)
-    rng.shuffle(unique_blocks)
+    if not block_sizes:
+        return {name: np.empty(0, dtype=np.int64) for name in fractions}
 
-    n_rows = block_ids.shape[0]
+    rng = np.random.default_rng(seed)
+    blocks = np.fromiter(block_sizes, dtype=np.int64, count=len(block_sizes))
+    rng.shuffle(blocks)
+    sizes = np.fromiter(
+        (block_sizes[int(b)] for b in blocks), dtype=np.int64, count=blocks.shape[0]
+    )
+    blocks = blocks[np.argsort(-sizes, kind="stable")]
+
+    n_rows = int(block_ids.shape[0])
     names = list(fractions)
     targets = {name: fractions[name] * n_rows for name in names}
-    assigned_rows = {name: 0 for name in names}
-    block_to_split: dict[int, str] = {}
+    assigned = {name: 0.0 for name in names}
+    block_to_code = {}
+    name_to_code = {name: i for i, name in enumerate(names)}
 
-    # Reserve the first split (usually train) as the overflow bucket.
-    primary = names[0]
-    for block in unique_blocks:
-        best_name = primary
-        best_deficit = -np.inf
-        for name in names[1:]:
-            deficit = targets[name] - assigned_rows[name]
-            if deficit > best_deficit and deficit > 0:
-                best_deficit = deficit
-                best_name = name
+    for block in blocks:
         bid = int(block)
-        block_to_split[bid] = best_name
-        assigned_rows[best_name] += block_sizes[bid]
+        best = max(names, key=lambda name: targets[name] - assigned[name])
+        block_to_code[bid] = name_to_code[best]
+        assigned[best] += block_sizes[bid]
 
-    indices: dict[str, list[int]] = {name: [] for name in names}
-    for row_idx, block in enumerate(block_ids):
-        indices[block_to_split[int(block)]].append(row_idx)
-
-    return {name: np.asarray(sorted(idx), dtype=np.int64) for name, idx in indices.items()}
-
-
-def cold_protein_split(
-    groups: np.ndarray,
-    fractions: dict[str, float],
-    seed: int = config.RANDOM_SEED,
-) -> dict[str, np.ndarray]:
-    """Partition row indices into protein-disjoint splits.
-
-    Args:
-        groups: Integer array ``(n_rows,)`` giving each row's protein group id.
-        fractions: Mapping from split name to target fraction of rows. The
-            fractions should sum to 1.0; the first-listed split absorbs any
-            rounding remainder.
-        seed: Random seed controlling the protein shuffle.
-
-    Returns:
-        A mapping from split name to a sorted ``int64`` array of row indices.
-        Every protein's rows land entirely within a single split.
-    """
-    unique_groups, group_counts = np.unique(groups, return_counts=True)
-    count_by_group = {int(g): int(c) for g, c in zip(unique_groups, group_counts)}
-    return _assign_blocks_to_splits(
-        np.asarray(groups, dtype=np.int64),
-        count_by_group,
-        fractions,
-        seed,
-    )
+    max_id = int(blocks.max())
+    remap = np.full(max_id + 1, -1, dtype=np.int8)
+    for bid, code in block_to_code.items():
+        remap[bid] = code
+    labels = remap[block_ids]
+    return {
+        name: np.flatnonzero(labels == code).astype(np.int64)
+        for name, code in name_to_code.items()
+    }
 
 
-def double_cold_split(
+def _bipartite_component_ids(
     protein_groups: np.ndarray,
     scaffold_groups: np.ndarray,
-    fractions: dict[str, float],
-    seed: int = config.RANDOM_SEED,
-) -> dict[str, np.ndarray]:
-    """Partition rows so splits share neither proteins nor scaffolds.
-
-    Builds the undirected bipartite co-occurrence graph of proteins and
-    scaffolds, takes connected components as atomic blocks, then greedily
-    assigns blocks to splits by row count.
+) -> np.ndarray:
+    """Label each row by connected component in the protein–scaffold graph.
 
     Args:
         protein_groups: Integer array ``(n_rows,)`` of protein group ids.
         scaffold_groups: Integer array ``(n_rows,)`` of Murcko scaffold ids.
-        fractions: Mapping from split name to target fraction of rows.
-        seed: Random seed controlling the component shuffle.
 
     Returns:
-        A mapping from split name to a sorted ``int64`` array of row indices.
+        Integer array ``(n_rows,)`` of component ids.
 
     Raises:
         ValueError: If the group arrays differ in length.
@@ -130,47 +101,79 @@ def double_cold_split(
             f"protein_groups length {protein_groups.shape[0]} does not match "
             f"scaffold_groups length {scaffold_groups.shape[0]}."
         )
+    if protein_groups.shape[0] == 0:
+        return np.empty(0, dtype=np.int64)
 
-    # Bipartite adjacency: protein nodes keyed as ("p", id), scaffolds as ("s", id).
-    neighbors: dict[tuple[str, int], set[tuple[str, int]]] = defaultdict(set)
-    for prot, scaff in zip(protein_groups.tolist(), scaffold_groups.tolist()):
-        p_node = ("p", int(prot))
-        s_node = ("s", int(scaff))
-        neighbors[p_node].add(s_node)
-        neighbors[s_node].add(p_node)
+    _, p_inv = np.unique(protein_groups, return_inverse=True)
+    _, s_inv = np.unique(scaffold_groups, return_inverse=True)
+    n_p = int(p_inv.max()) + 1
+    n_s = int(s_inv.max()) + 1
+    parent = np.arange(n_p + n_s, dtype=np.int64)
 
-    # Connected components over the bipartite graph.
-    visited: set[tuple[str, int]] = set()
-    node_to_component: dict[tuple[str, int], int] = {}
-    component_id = 0
-    for start in list(neighbors):
-        if start in visited:
-            continue
-        queue: deque[tuple[str, int]] = deque([start])
-        visited.add(start)
-        while queue:
-            node = queue.popleft()
-            node_to_component[node] = component_id
-            for nxt in neighbors[node]:
-                if nxt not in visited:
-                    visited.add(nxt)
-                    queue.append(nxt)
-        component_id += 1
+    def find(x: int) -> int:
+        """Return the union-find root of node ``x`` with path compression."""
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = int(parent[x])
+        return x
 
-    # Map each row to its component; isolated nodes still get a component via
-    # the protein/scaffold id even if somehow missing from neighbors (should not
-    # happen for observed pairs).
-    n_rows = protein_groups.shape[0]
-    block_ids = np.empty(n_rows, dtype=np.int64)
-    block_sizes: dict[int, int] = defaultdict(int)
-    for i, (prot, scaff) in enumerate(
-        zip(protein_groups.tolist(), scaffold_groups.tolist())
-    ):
-        cid = node_to_component[("p", int(prot))]
-        block_ids[i] = cid
-        block_sizes[cid] += 1
+    pairs = np.unique(np.stack((p_inv, s_inv), axis=1), axis=0)
+    for pi, si in pairs:
+        ra, rb = find(int(pi)), find(int(si) + n_p)
+        if ra != rb:
+            parent[rb] = ra
 
-    return _assign_blocks_to_splits(block_ids, dict(block_sizes), fractions, seed)
+    for i in range(parent.shape[0]):
+        parent[i] = find(i)
+    return parent[p_inv]
+
+
+def cold_protein_split(
+    groups: np.ndarray,
+    fractions: dict[str, float],
+    seed: int = config.RANDOM_SEED,
+) -> dict[str, np.ndarray]:
+    """Partition row indices into protein-disjoint splits.
+
+    Args:
+        groups: Integer array ``(n_rows,)`` giving each row's protein group id.
+        fractions: Mapping from split name to target fraction of rows.
+        seed: Random seed controlling block tie-breaking.
+
+    Returns:
+        A mapping from split name to a sorted ``int64`` array of row indices.
+        Every protein's rows land entirely within a single split.
+    """
+    groups = np.asarray(groups, dtype=np.int64)
+    unique_groups, group_counts = np.unique(groups, return_counts=True)
+    count_by_group = {int(g): int(c) for g, c in zip(unique_groups, group_counts)}
+    return _assign_blocks_to_splits(groups, count_by_group, fractions, seed)
+
+
+def double_cold_split(
+    protein_groups: np.ndarray,
+    scaffold_groups: np.ndarray,
+    fractions: dict[str, float],
+    seed: int = config.RANDOM_SEED,
+) -> dict[str, np.ndarray]:
+    """Partition rows so splits share neither proteins nor scaffolds.
+
+    Builds connected components of the protein–scaffold co-occurrence graph,
+    then greedily assigns components to splits by row count.
+
+    Args:
+        protein_groups: Integer array ``(n_rows,)`` of protein group ids.
+        scaffold_groups: Integer array ``(n_rows,)`` of Murcko scaffold ids.
+        fractions: Mapping from split name to target fraction of rows.
+        seed: Random seed controlling component tie-breaking.
+
+    Returns:
+        A mapping from split name to a sorted ``int64`` array of row indices.
+    """
+    block_ids = _bipartite_component_ids(protein_groups, scaffold_groups)
+    unique_blocks, counts = np.unique(block_ids, return_counts=True)
+    block_sizes = {int(b): int(c) for b, c in zip(unique_blocks, counts)}
+    return _assign_blocks_to_splits(block_ids, block_sizes, fractions, seed)
 
 
 def _split_path(signature: str, split_type: str, seed: int, splits_dir: str) -> str:
@@ -305,6 +308,48 @@ def load_split(
     return _validate_split(split, expected_n_rows)
 
 
+def _get_or_create_split(
+    *,
+    n_rows: int,
+    signature: str,
+    split_type: str,
+    seed: int,
+    splits_dir: str,
+    verbose: bool,
+    builder: Callable[[], dict[str, np.ndarray]],
+    created_detail: str = "",
+) -> dict[str, np.ndarray]:
+    """Return a cached split or build, save, and return a new one.
+
+    Args:
+        n_rows: Expected dataset row count.
+        signature: Dataset signature.
+        split_type: Human-readable split label.
+        seed: Random seed used for the cache key.
+        splits_dir: Directory for split files.
+        verbose: If ``True``, print reuse/create messages.
+        builder: Zero-arg callable that builds the split mapping.
+        created_detail: Optional extra text appended to the create log line.
+
+    Returns:
+        The split mapping from name to row-index array.
+    """
+    existing = load_split(signature, split_type, seed, splits_dir, n_rows=n_rows)
+    if existing is not None:
+        if verbose:
+            sizes = ", ".join(f"{k}={len(v)}" for k, v in existing.items())
+            print(f"[split] reusing {split_type} ({sizes})")
+        return existing
+
+    split = builder()
+    save_split(split, signature, split_type, seed, splits_dir)
+    if verbose:
+        sizes = ", ".join(f"{k}={len(v)}" for k, v in split.items())
+        suffix = f": {created_detail} | {sizes}" if created_detail else f" ({sizes})"
+        print(f"[split] created {split_type}{suffix}")
+    return split
+
+
 def get_or_create_double_cold_split(
     protein_groups: np.ndarray,
     scaffold_groups: np.ndarray,
@@ -330,59 +375,17 @@ def get_or_create_double_cold_split(
     Returns:
         The split mapping from name to row-index array.
     """
-    existing = load_split(
-        signature, split_type, seed, splits_dir, n_rows=protein_groups.shape[0]
+    return _get_or_create_split(
+        n_rows=int(np.asarray(protein_groups).shape[0]),
+        signature=signature,
+        split_type=split_type,
+        seed=seed,
+        splits_dir=splits_dir,
+        verbose=verbose,
+        builder=lambda: double_cold_split(
+            protein_groups, scaffold_groups, fractions, seed
+        ),
     )
-    if existing is not None:
-        if verbose:
-            sizes = ", ".join(f"{k}={len(v)}" for k, v in existing.items())
-            print(f"[split] reusing {split_type} ({sizes})")
-        return existing
-    split = double_cold_split(protein_groups, scaffold_groups, fractions, seed)
-    save_split(split, signature, split_type, seed, splits_dir)
-    if verbose:
-        sizes = ", ".join(f"{k}={len(v)}" for k, v in split.items())
-        print(f"[split] created {split_type} ({sizes})")
-    return split
-
-
-def get_or_create_split(
-    groups: np.ndarray,
-    fractions: dict[str, float],
-    signature: str,
-    split_type: str,
-    seed: int = config.RANDOM_SEED,
-    splits_dir: str = config.SPLITS_DIR,
-    verbose: bool = True,
-) -> dict[str, np.ndarray]:
-    """Return a saved cold-protein split or create, save and return a new one.
-
-    Args:
-        groups: Per-row protein group ids.
-        fractions: Target row fractions per split.
-        signature: Dataset signature.
-        split_type: Human-readable split label.
-        seed: Random seed.
-        splits_dir: Directory for split files.
-        verbose: If ``True``, print whether the split was reused or created.
-
-    Returns:
-        The split mapping from name to row-index array.
-    """
-    existing = load_split(
-        signature, split_type, seed, splits_dir, n_rows=groups.shape[0]
-    )
-    if existing is not None:
-        if verbose:
-            sizes = ", ".join(f"{k}={len(v)}" for k, v in existing.items())
-            print(f"[split] reusing {split_type} ({sizes})")
-        return existing
-    split = cold_protein_split(groups, fractions, seed)
-    save_split(split, signature, split_type, seed, splits_dir)
-    if verbose:
-        sizes = ", ".join(f"{k}={len(v)}" for k, v in split.items())
-        print(f"[split] created {split_type} ({sizes})")
-    return split
 
 
 def train_test_split(
@@ -590,14 +593,14 @@ def get_or_create_time_split(
     Returns:
         The split mapping.
     """
+    years = np.asarray(years)
+    n = int(years.shape[0])
     split_type = (
         f"time__val{100.0 * val_fraction:g}pct"
         f"__test{100.0 * test_fraction:g}pct"
         + ("" if include_val else "__val-merged")
     )
-    existing = load_split(
-        signature, split_type, seed, splits_dir, n_rows=years.shape[0]
-    )
+    existing = load_split(signature, split_type, seed, splits_dir, n_rows=n)
     if existing is not None:
         if verbose:
             sizes = ", ".join(f"{k}={len(v)}" for k, v in existing.items())
@@ -608,13 +611,11 @@ def get_or_create_time_split(
     split = time_split(years, val_year, test_year, include_val=include_val)
     save_split(split, signature, split_type, seed, splits_dir)
     if verbose:
-        n = years.shape[0]
-        missing = int(np.sum(years < 0))
         sizes = ", ".join(
             f"{k}={len(v)} ({100.0 * len(v) / max(n, 1):.1f}%)" for k, v in split.items()
         )
         print(
             f"[split] created {split_type}: val_year={val_year} test_year={test_year} "
-            f"missing_year={missing} | {sizes}"
+            f"missing_year={int(np.sum(years < 0))} | {sizes}"
         )
     return split

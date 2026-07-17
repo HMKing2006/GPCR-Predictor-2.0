@@ -13,4 +13,5 @@ __pycache__/
 # Large local artifacts (rebuilt from scripts)
 cache/
 data/train/
+data/benchmark/
 models/
