@@ -326,6 +326,7 @@ class MLPModel(BaseRegressor):
         patience: int = int(config.MLP_DEFAULTS["patience"]),
         es_val_fraction: float = float(config.MLP_DEFAULTS["es_val_fraction"]),
         es_min_delta: float = float(config.MLP_DEFAULTS["es_min_delta"]),
+        class_weights: bool = bool(config.MLP_DEFAULTS["class_weights"]),
         use_batchnorm: bool = bool(config.MLP_DEFAULTS["use_batchnorm"]),
         use_bilinear: bool = bool(config.MLP_DEFAULTS["use_bilinear"]),
         bilinear_dim: int = int(config.MLP_DEFAULTS["bilinear_dim"]),
@@ -351,6 +352,8 @@ class MLPModel(BaseRegressor):
                 fit set).
             es_min_delta: Minimum validation-AUROC increase counted as an
                 improvement.
+            class_weights: If ``True``, set BCE ``pos_weight`` to
+                ``n_neg / n_pos`` on the fit rows (inverse class frequency).
             use_batchnorm: If ``True``, add BatchNorm1d after each hidden layer.
             use_bilinear: If ``True``, append a learned bilinear protein/ligand
                 interaction vector before the MLP trunk.
@@ -372,6 +375,7 @@ class MLPModel(BaseRegressor):
         self.patience = int(patience)
         self.es_val_fraction = float(es_val_fraction)
         self.es_min_delta = float(es_min_delta)
+        self.class_weights = bool(class_weights)
         self.use_batchnorm = bool(use_batchnorm)
         self.use_bilinear = bool(use_bilinear)
         self.bilinear_dim = int(bilinear_dim)
@@ -383,6 +387,7 @@ class MLPModel(BaseRegressor):
         self.net: Optional[_MLP] = None
         self.feature_mean: Optional[np.ndarray] = None
         self.feature_std: Optional[np.ndarray] = None
+        self.pos_weight: Optional[float] = None
 
     def _standardize_stats(self, X: Any, rows: Optional[np.ndarray] = None) -> None:
         """Compute per-feature mean and std over selected rows in chunks.
@@ -478,7 +483,8 @@ class MLPModel(BaseRegressor):
         weights are cached and restored at the end, and training stops early
         once AUROC fails to improve by ``es_min_delta`` for ``patience``
         consecutive epochs. Early stopping is skipped when ``patience`` is
-        ``0``.
+        ``0``. When ``class_weights`` is enabled, BCE uses
+        ``pos_weight = n_neg / n_pos`` computed on the fit rows.
 
         Args:
             X: Feature matrix ``(n, d)`` (may be a memmap).
@@ -589,7 +595,29 @@ class MLPModel(BaseRegressor):
         optimizer = torch.optim.Adam(
             self.net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
         )
-        loss_fn = nn.BCEWithLogitsLoss()
+        y_fit = y_np[train_rows]
+        n_pos = float(y_fit.sum())
+        n_neg = float(y_fit.shape[0]) - n_pos
+        if self.class_weights and n_pos > 0.0:
+            self.pos_weight = n_neg / n_pos
+            loss_fn = nn.BCEWithLogitsLoss(
+                pos_weight=torch.tensor([self.pos_weight], device=self.device)
+            )
+            if verbose:
+                print(
+                    f"[mlp] BCE pos_weight={self.pos_weight:.4f} "
+                    f"(n_pos={int(n_pos)}, n_neg={int(n_neg)})",
+                    flush=True,
+                )
+        else:
+            self.pos_weight = None
+            loss_fn = nn.BCEWithLogitsLoss()
+            if verbose and self.class_weights and n_pos <= 0.0:
+                print(
+                    "[mlp] class_weights requested but no positives in fit "
+                    "set; using unweighted BCE",
+                    flush=True,
+                )
         best_auroc = -math.inf
         best_state: Optional[dict[str, torch.Tensor]] = None
         best_epoch = 0
@@ -687,6 +715,8 @@ class MLPModel(BaseRegressor):
             "epochs": self.epochs,
             "learning_rate": self.learning_rate,
             "weight_decay": self.weight_decay,
+            "class_weights": self.class_weights,
+            "pos_weight": self.pos_weight,
             "use_batchnorm": self.use_batchnorm,
             "use_bilinear": self.use_bilinear,
             "bilinear_dim": self.bilinear_dim,
@@ -748,6 +778,14 @@ def load_model(path: str) -> BaseRegressor:
         bilinear_dim = int(state.get("bilinear_dim", config.MLP_DEFAULTS["bilinear_dim"]))
         protein_dim = int(state.get("protein_dim", config.PROTEIN_EMB_DIM))
         ligand_dim = int(state.get("ligand_dim", config.LIGAND_EMB_DIM))
+        class_weights = bool(
+            state.get(
+                "class_weights",
+                state.get(
+                    "balance_pos_weight", config.MLP_DEFAULTS["class_weights"]
+                ),
+            )
+        )
         model = MLPModel(
             hidden_dim=state["hidden_dim"],
             num_layers=state["num_layers"],
@@ -756,6 +794,7 @@ def load_model(path: str) -> BaseRegressor:
             epochs=state["epochs"],
             learning_rate=state["learning_rate"],
             weight_decay=state["weight_decay"],
+            class_weights=class_weights,
             use_batchnorm=use_batchnorm,
             use_bilinear=use_bilinear,
             bilinear_dim=bilinear_dim,
@@ -764,6 +803,9 @@ def load_model(path: str) -> BaseRegressor:
             seed=state["seed"],
         )
         model.input_dim = int(state["input_dim"])
+        model.pos_weight = (
+            None if state.get("pos_weight") is None else float(state["pos_weight"])
+        )
         model.net = _MLP(
             state["input_dim"],
             state["hidden_dim"],

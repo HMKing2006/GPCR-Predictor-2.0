@@ -54,6 +54,7 @@ def collect_hyperparams(args: argparse.Namespace, model_type: str) -> dict[str, 
         "weight_decay": args.weight_decay,
         "patience": args.patience,
         "es_val_fraction": args.es_val_fraction,
+        "class_weights": args.class_weights,
         "use_batchnorm": args.batchnorm,
         "use_bilinear": args.bilinear,
         "bilinear_dim": args.bilinear_dim,
@@ -426,6 +427,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=float(config.MLP_DEFAULTS["es_val_fraction"]),
         help="Target fraction of training rows for the double-cold MLP ES holdout.",
+    )
+    p.add_argument(
+        "--class-weights",
+        action=argparse.BooleanOptionalAction,
+        default=bool(config.MLP_DEFAULTS["class_weights"]),
+        help=(
+            "Weight BCE positives by n_neg/n_pos on the fit rows (default: on). "
+            "Use --no-class-weights for unweighted BCE."
+        ),
     )
     p.add_argument(
         "--batchnorm",

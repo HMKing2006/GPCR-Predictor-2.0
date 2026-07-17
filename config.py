@@ -143,6 +143,8 @@ RF_DEFAULTS: Final[dict[str, int]] = {
 # tracked after every epoch, the best weights are restored, and training stops
 # once AUROC fails to improve for ``patience`` consecutive epochs. Set
 # ``patience`` to ``0`` to disable early stopping and always run ``epochs``.
+# ``class_weights`` sets BCE ``pos_weight`` to ``n_neg / n_pos`` on the fit
+# rows (inverse class frequency) to counter sparse actives; disable for plain BCE.
 # ``use_batchnorm`` inserts BatchNorm1d after each hidden linear layer.
 # ``use_bilinear`` adds a learned protein/ligand bilinear interaction block: the
 # protein and ligand embeddings are projected to ``bilinear_dim`` and combined by
@@ -158,6 +160,7 @@ MLP_DEFAULTS: Final[dict[str, Any]] = {
     "patience": 4,
     "es_val_fraction": 0.05,
     "es_min_delta": 1e-4,
+    "class_weights": True,
     "use_batchnorm": False,
     "use_bilinear": False,
     "bilinear_dim": 256,

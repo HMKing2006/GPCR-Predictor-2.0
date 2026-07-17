@@ -260,6 +260,9 @@ python train.py --data data/train/Papyrus_pp_prepared.parquet --split-mode time 
 # MLP with custom hyperparameters
 python train.py --model mlp --epochs 30 --hidden-dim 2048 --learning-rate 5e-4
 
+# MLP without inverse-frequency BCE class weights (on by default)
+python train.py --model mlp --no-class-weights
+
 # Random forest memory/accuracy tuning
 python train.py --model rf --n-estimators 400 --rf-batch-trees 25 --rf-shard-rows 50000
 
@@ -274,9 +277,16 @@ saved to `models/` as a joblib file. Splits are saved under the matching
 `cache/datasets/<stem>/splits/` directory and reused only when their embedded
 row-layout signature and seed match.
 
-MLP early stopping uses a **double-cold holdout** carved from the training split
-(~5% of train rows; no protein or scaffold overlap with the fit set), including
-when the outer split is temporal.
+MLP early stopping carves a holdout from the **training** split (~5% of train
+rows by target). It prefers a **double-cold** holdout (no protein or scaffold
+overlap with the fit set). If that holdout is too small — common when the
+protein–scaffold graph forms a giant connected component — it falls back to a
+**cold-protein** holdout. This applies for both double-cold and temporal outer
+splits; under `--split-mode time`, early stopping is therefore not itself a
+future-year holdout (the outer val/test folds remain temporal).
+
+By default the MLP uses **class weights**: BCE `pos_weight = n_neg / n_pos` on
+the fit rows (inverse class frequency). Disable with `--no-class-weights`.
 
 ## Grid search
 
@@ -295,12 +305,17 @@ python grid_search.py --include-assay-context --rebuild-features
 
 # Include random-forest baselines
 python grid_search.py --include-rf
+
+# Disable MLP class weights for the whole grid
+python grid_search.py --no-class-weights
 ```
 
 Iterates over MLP hyperparameter combinations (and optionally RF baselines) using
 an 80/10/10 double-cold split by default (or temporal fractions with
 `--split-mode time`), prints each candidate's validation AUROC as it finishes,
 evaluates the best model on test with novelty breakouts, and saves to `models/`.
+MLP candidates inherit early stopping and `class_weights` (BCE
+`pos_weight = n_neg / n_pos`) from `config.MLP_DEFAULTS` unless overridden.
 
 ## Prediction
 

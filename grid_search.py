@@ -83,6 +83,7 @@ def _merge_defaults(model_type: str, overrides: dict[str, Any]) -> dict[str, Any
             "weight_decay": float(config.MLP_DEFAULTS["weight_decay"]),
             "patience": int(config.MLP_DEFAULTS["patience"]),
             "es_val_fraction": float(config.MLP_DEFAULTS["es_val_fraction"]),
+            "class_weights": bool(config.MLP_DEFAULTS["class_weights"]),
             "use_batchnorm": bool(config.MLP_DEFAULTS["use_batchnorm"]),
             "use_bilinear": bool(config.MLP_DEFAULTS["use_bilinear"]),
             "bilinear_dim": int(config.MLP_DEFAULTS["bilinear_dim"]),
@@ -120,6 +121,8 @@ def run_grid_search(args: argparse.Namespace) -> str:
 
     for index, (model_type, overrides) in enumerate(grid):
         hyperparams = _merge_defaults(model_type, overrides)
+        if model_type == "mlp":
+            hyperparams["class_weights"] = bool(args.class_weights)
         desc = f"{model_type} {overrides}"
         print(f"\n[grid] ({index + 1}/{len(grid)}) training {desc}")
         model = fit_on_indices(
@@ -237,6 +240,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--include-rf",
         action="store_true",
         help="Also evaluate the random-forest baselines (off by default).",
+    )
+    p.add_argument(
+        "--class-weights",
+        action=argparse.BooleanOptionalAction,
+        default=bool(config.MLP_DEFAULTS["class_weights"]),
+        help=(
+            "Weight MLP BCE positives by n_neg/n_pos on the fit rows (default: on). "
+            "Use --no-class-weights for unweighted BCE."
+        ),
     )
     p.add_argument("--quiet", action="store_true")
     return p
