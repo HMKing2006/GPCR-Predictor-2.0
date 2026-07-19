@@ -1,7 +1,9 @@
 """Scaffold-cold and percentage time splits for ligand multilabel datasets.
 
-Pure helpers are copied from the pair ``src.splits`` module so this package can
-be deleted without depending on pair split APIs.
+Outer folds can use independent ``scaffold`` / ``time`` strategies: test is
+carved first, then validation from the remainder (when a validation fold is
+requested). Pure helpers are kept local so this package can be deleted without
+depending on pair split APIs.
 """
 
 from __future__ import annotations
@@ -12,6 +14,10 @@ from typing import Callable, Optional
 import numpy as np
 
 from src.multilabel import config as ml_config
+
+# Supported outer-fold strategies for multilabel ``--test-split`` /
+# ``--validation-split``.
+SPLIT_STRATEGIES: tuple[str, ...] = ml_config.SPLIT_STRATEGIES
 
 
 def _assign_blocks_to_splits(
@@ -461,3 +467,313 @@ def get_or_create_time_split(
             f"missing_year={int(np.sum(years < 0))} | {sizes}"
         )
     return split
+
+
+def _validate_strategy(name: str, strategy: str) -> str:
+    """Return ``strategy`` if it is a known multilabel split strategy.
+
+    Args:
+        name: Flag or argument name for error messages.
+        strategy: Requested strategy token.
+
+    Returns:
+        The validated strategy string.
+
+    Raises:
+        ValueError: If ``strategy`` is not in :data:`SPLIT_STRATEGIES`.
+    """
+    strategy = str(strategy).strip()
+    if strategy not in SPLIT_STRATEGIES:
+        raise ValueError(
+            f"Unknown {name}={strategy!r}; choose one of {SPLIT_STRATEGIES}."
+        )
+    return strategy
+
+
+def _partition_pool(
+    pool: np.ndarray,
+    strategy: str,
+    fractions: dict[str, float],
+    *,
+    scaffold_groups: np.ndarray,
+    years: Optional[np.ndarray],
+    seed: int,
+) -> dict[str, np.ndarray]:
+    """Partition a pool of global ligand indices with one strategy.
+
+    Args:
+        pool: Global row indices to partition.
+        strategy: One of :data:`SPLIT_STRATEGIES`.
+        fractions: Mapping from fold name to target fraction within ``pool``.
+        scaffold_groups: Full-dataset scaffold ids (required for scaffold).
+        years: Full-dataset years (required for time); ``-1`` when missing.
+        seed: Random seed for scaffold assignment.
+
+    Returns:
+        Mapping from fold name to sorted global row-index arrays.
+
+    Raises:
+        ValueError: If a required array is missing for ``strategy``.
+    """
+    pool = np.asarray(pool, dtype=np.int64)
+    if pool.size == 0:
+        return {name: np.empty(0, dtype=np.int64) for name in fractions}
+
+    strategy = _validate_strategy("strategy", strategy)
+    scaffold_groups = np.asarray(scaffold_groups)
+
+    if strategy == "scaffold":
+        local = scaffold_cold_split(scaffold_groups[pool], fractions, seed=seed)
+    else:  # time
+        if years is None:
+            raise ValueError("time splits require years.")
+        years_arr = np.asarray(years)
+        names = set(fractions)
+        if names == {"train", "test"}:
+            val_year, test_year = year_cutoffs_from_fractions(
+                years_arr[pool], 0.0, float(fractions["test"])
+            )
+            local = time_split(
+                years_arr[pool], val_year, test_year, include_val=False
+            )
+        elif names == {"train", "val"}:
+            val_year, test_year = year_cutoffs_from_fractions(
+                years_arr[pool], 0.0, float(fractions["val"])
+            )
+            two_way = time_split(
+                years_arr[pool], val_year, test_year, include_val=False
+            )
+            local = {"train": two_way["train"], "val": two_way["test"]}
+        elif names == {"train", "val", "test"}:
+            val_year, test_year = year_cutoffs_from_fractions(
+                years_arr[pool],
+                float(fractions["val"]),
+                float(fractions["test"]),
+            )
+            local = time_split(
+                years_arr[pool], val_year, test_year, include_val=True
+            )
+        else:
+            raise ValueError(
+                f"Unsupported time-split fraction keys: {sorted(fractions)}"
+            )
+
+    return {
+        name: np.sort(pool[local_idx]).astype(np.int64)
+        for name, local_idx in local.items()
+    }
+
+
+def _build_nested_split(
+    *,
+    test_split: str,
+    validation_split: str,
+    scaffold_groups: np.ndarray,
+    years: Optional[np.ndarray],
+    val_fraction: float,
+    test_fraction: float,
+    include_val: bool,
+    seed: int,
+) -> dict[str, np.ndarray]:
+    """Build train/val/test by carving test first, then val from the remainder.
+
+    Args:
+        test_split: Strategy for the test fold.
+        validation_split: Strategy for the validation fold (ignored when
+            ``include_val`` is ``False``).
+        scaffold_groups: Per-row Murcko scaffold ids.
+        years: Per-row years (for time); ``-1`` when missing.
+        val_fraction: Target fraction of *all* rows for validation.
+        test_fraction: Target fraction of *all* rows for test.
+        include_val: If ``False``, return only train/test (remainder → train).
+        seed: Random seed.
+
+    Returns:
+        Split mapping with ``train`` / ``test``, and ``val`` when requested.
+
+    Raises:
+        ValueError: If fractions are invalid or a required array is missing.
+    """
+    test_split = _validate_strategy("test_split", test_split)
+    validation_split = _validate_strategy("validation_split", validation_split)
+    if val_fraction < 0.0 or test_fraction < 0.0:
+        raise ValueError("val_fraction and test_fraction must be non-negative.")
+    if include_val and val_fraction + test_fraction >= 1.0:
+        raise ValueError("val_fraction + test_fraction must be < 1.0.")
+    if not include_val and test_fraction >= 1.0:
+        raise ValueError("test_fraction must be < 1.0.")
+
+    scaffold_groups = np.asarray(scaffold_groups)
+    n = int(scaffold_groups.shape[0])
+    all_idx = np.arange(n, dtype=np.int64)
+
+    # Matched time strategies: keep legacy year-window semantics (val_fraction
+    # sizes the middle year band even when it is later merged into train).
+    if test_split == "time" and validation_split == "time":
+        if years is None:
+            raise ValueError("time splits require years.")
+        val_year, test_year = year_cutoffs_from_fractions(
+            np.asarray(years), val_fraction, test_fraction
+        )
+        return time_split(
+            np.asarray(years), val_year, test_year, include_val=include_val
+        )
+
+    if include_val and test_split == validation_split:
+        fractions = {
+            "train": 1.0 - val_fraction - test_fraction,
+            "val": val_fraction,
+            "test": test_fraction,
+        }
+        return _partition_pool(
+            all_idx,
+            test_split,
+            fractions,
+            scaffold_groups=scaffold_groups,
+            years=years,
+            seed=seed,
+        )
+
+    if (not include_val) and test_split == validation_split:
+        fractions = {"train": 1.0 - test_fraction, "test": test_fraction}
+        return _partition_pool(
+            all_idx,
+            test_split,
+            fractions,
+            scaffold_groups=scaffold_groups,
+            years=years,
+            seed=seed,
+        )
+
+    rest_frac = 1.0 - test_fraction
+    step1 = _partition_pool(
+        all_idx,
+        test_split,
+        {"train": rest_frac, "test": test_fraction},
+        scaffold_groups=scaffold_groups,
+        years=years,
+        seed=seed,
+    )
+    pool = step1["train"]
+    test_idx = step1["test"]
+
+    if not include_val:
+        return {"train": pool, "test": test_idx}
+
+    pool_n = int(pool.shape[0])
+    if pool_n == 0:
+        return {
+            "train": np.empty(0, dtype=np.int64),
+            "val": np.empty(0, dtype=np.int64),
+            "test": test_idx,
+        }
+    val_rel = float(val_fraction) * n / float(pool_n)
+    val_rel = float(min(max(val_rel, 0.0), 0.99))
+    step2 = _partition_pool(
+        pool,
+        validation_split,
+        {"train": 1.0 - val_rel, "val": val_rel},
+        scaffold_groups=scaffold_groups,
+        years=years,
+        seed=seed + 1,
+    )
+    return {
+        "train": step2["train"],
+        "val": step2["val"],
+        "test": test_idx,
+    }
+
+
+def get_or_create_nested_split(
+    *,
+    scaffold_groups: np.ndarray,
+    signature: str,
+    test_split: str = ml_config.DEFAULT_TEST_SPLIT,
+    validation_split: str = ml_config.DEFAULT_VALIDATION_SPLIT,
+    val_fraction: float = ml_config.VAL_FRACTION,
+    test_fraction: float = ml_config.TEST_FRACTION,
+    include_val: bool = False,
+    years: Optional[np.ndarray] = None,
+    seed: int = ml_config.RANDOM_SEED,
+    splits_dir: str = "",
+    verbose: bool = True,
+) -> dict[str, np.ndarray]:
+    """Return a cached nested train/val/test split or create a new one.
+
+    Args:
+        scaffold_groups: Per-row Murcko scaffold ids.
+        signature: Dataset signature for cache binding.
+        test_split: Strategy for the test fold (``scaffold`` or ``time``).
+        validation_split: Strategy for the validation fold. Ignored when
+            ``include_val`` is ``False``. When equal to ``test_split``, a
+            single joint partition is used.
+        val_fraction: Target fraction of all rows for validation.
+        test_fraction: Target fraction of all rows for test.
+        include_val: If ``False``, return train/test only.
+        years: Required when either strategy is ``time``; ``-1`` if missing.
+        seed: Random seed for scaffold assignment.
+        splits_dir: Directory for split cache files.
+        verbose: If ``True``, print reuse/create messages.
+
+    Returns:
+        Split mapping with ``train`` / ``test``, and ``val`` when requested.
+
+    Raises:
+        ValueError: If strategies/fractions are invalid or required inputs for
+            a strategy are missing.
+    """
+    test_split = _validate_strategy("test_split", test_split)
+    validation_split = _validate_strategy("validation_split", validation_split)
+    needs_time = test_split == "time" or (
+        include_val and validation_split == "time"
+    )
+    if needs_time and years is None:
+        raise ValueError(
+            "Time split requires dated ligands. Rebuild multilabel prepared "
+            "tables from a Papyrus source that includes Year."
+        )
+    if needs_time:
+        years_arr = np.asarray(years)
+        if int(np.sum(years_arr >= 0)) == 0:
+            raise ValueError(
+                "Time split requires dated ligands. Rebuild multilabel "
+                "prepared tables from a Papyrus source that includes Year."
+            )
+    else:
+        years_arr = None
+
+    scaffold_groups = np.asarray(scaffold_groups)
+    n = int(scaffold_groups.shape[0])
+    effective_val = validation_split if include_val else test_split
+    split_type = (
+        f"nested__test-{test_split}__val-{effective_val}"
+        f"__val{100.0 * val_fraction:g}pct"
+        f"__test{100.0 * test_fraction:g}pct"
+        + ("" if include_val else "__val-merged")
+    )
+
+    def _builder() -> dict[str, np.ndarray]:
+        """Build the nested multilabel split for caching."""
+        return _build_nested_split(
+            test_split=test_split,
+            validation_split=validation_split,
+            scaffold_groups=scaffold_groups,
+            years=years_arr,
+            val_fraction=val_fraction,
+            test_fraction=test_fraction,
+            include_val=include_val,
+            seed=seed,
+        )
+
+    return _get_or_create_split(
+        n_rows=n,
+        signature=signature,
+        split_type=split_type,
+        seed=seed,
+        splits_dir=splits_dir,
+        verbose=verbose,
+        builder=_builder,
+        created_detail=(
+            f"test_split={test_split} validation_split={validation_split}"
+        ),
+    )

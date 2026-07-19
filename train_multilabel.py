@@ -13,7 +13,7 @@ from src.multilabel import config as ml_config
 from src.multilabel.featurize import build_ligand_features, default_paths_for_task
 from src.multilabel.metrics import print_multilabel_metrics
 from src.multilabel.models import MultilabelMLP
-from src.multilabel.splits import get_or_create_time_split, train_test_scaffold_split
+from src.multilabel.splits import SPLIT_STRATEGIES, get_or_create_nested_split
 from src.multilabel.vocab import load_vocab
 
 
@@ -41,7 +41,11 @@ def collect_hyperparams(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _resolve_split(dataset, args: argparse.Namespace) -> dict[str, np.ndarray]:
-    """Create or reuse the requested scaffold or time split.
+    """Create or reuse nested scaffold/time outer folds.
+
+    Test is carved with ``args.test_split`` first. ``train_multilabel`` merges
+    any validation fold into train (``include_val=False``), matching pair
+    ``train.py`` behavior.
 
     Args:
         dataset: Ligand feature dataset.
@@ -53,28 +57,32 @@ def _resolve_split(dataset, args: argparse.Namespace) -> dict[str, np.ndarray]:
     Raises:
         SystemExit: If a time split is requested without dated ligands.
     """
-    if args.split_mode == "time":
+    test_split = args.test_split
+    validation_split = args.validation_split
+    needs_time = test_split == "time" or validation_split == "time"
+    years = None
+    if needs_time:
         try:
-            return get_or_create_time_split(
-                dataset.load_years(),
-                dataset.signature,
-                val_fraction=args.val_fraction,
-                test_fraction=args.test_fraction,
-                include_val=False,
-                seed=args.seed,
-                splits_dir=dataset.split_directory,
-                verbose=not args.quiet,
-            )
-        except ValueError as exc:
+            years = dataset.load_years()
+        except FileNotFoundError as exc:
             raise SystemExit(str(exc)) from exc
-    return train_test_scaffold_split(
-        dataset.load_scaffold_groups(),
-        dataset.signature,
-        test_fraction=args.test_fraction,
-        seed=args.seed,
-        splits_dir=dataset.split_directory,
-        verbose=not args.quiet,
-    )
+
+    try:
+        return get_or_create_nested_split(
+            scaffold_groups=dataset.load_scaffold_groups(),
+            signature=dataset.signature,
+            test_split=test_split,
+            validation_split=validation_split,
+            val_fraction=float(args.val_fraction),
+            test_fraction=float(args.test_fraction),
+            include_val=False,
+            years=years,
+            seed=args.seed,
+            splits_dir=dataset.split_directory,
+            verbose=not args.quiet,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -117,22 +125,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Force rebuild of the ligand feature snapshot.",
     )
     parser.add_argument(
-        "--split-mode",
-        choices=["scaffold", "time"],
-        default="scaffold",
-        help="scaffold-cold (default) or percentage publication-year time split.",
+        "--test-split",
+        choices=list(SPLIT_STRATEGIES),
+        default=ml_config.DEFAULT_TEST_SPLIT,
+        help=(
+            "Strategy for the held-out test fold: Murcko-scaffold cold "
+            "(default) or publication-year time."
+        ),
+    )
+    parser.add_argument(
+        "--validation-split",
+        choices=list(SPLIT_STRATEGIES),
+        default=ml_config.DEFAULT_VALIDATION_SPLIT,
+        help=(
+            "Strategy for the validation fold (default: scaffold). Test is "
+            "carved first; val is carved from the remainder when a val fold is "
+            "kept. train_multilabel merges val into train."
+        ),
     )
     parser.add_argument(
         "--test-fraction",
         type=float,
         default=ml_config.TEST_FRACTION,
-        help="Test fraction (scaffold rows or dated ligands for time).",
+        help="Test fraction of all ligands (strategy-dependent assignment).",
     )
     parser.add_argument(
         "--val-fraction",
         type=float,
         default=ml_config.VAL_FRACTION,
-        help="Validation fraction for --split-mode time (merged into train for fit).",
+        help=(
+            "Validation fraction of all ligands. Used to size time windows and "
+            "nested val carves; merged into train by this entrypoint."
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -235,7 +259,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         "feature_signature": dataset.signature,
         "feature_directory": dataset.directory,
         "ligand_embedding_aliases": list(dataset.ligand_aliases),
-        "split_mode": args.split_mode,
+        "test_split": args.test_split,
+        "validation_split": args.validation_split,
     }
     if verbose:
         mean_labels = float(y_train.sum(axis=1).mean()) if y_train.size else 0.0
@@ -263,7 +288,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         os.makedirs(ml_config.MODELS_DIR, exist_ok=True)
         output = os.path.join(
             ml_config.MODELS_DIR,
-            f"{args.task}_multilabel__{args.split_mode}.joblib",
+            (
+                f"{args.task}_multilabel"
+                f"__test-{args.test_split}"
+                f"__val-{args.validation_split}.joblib"
+            ),
         )
     model.save(output)
     if verbose:

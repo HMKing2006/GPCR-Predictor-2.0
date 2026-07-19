@@ -125,6 +125,13 @@ TEST_FRACTION: Final[float] = 0.20
 GRID_VAL_FRACTION: Final[float] = 0.10
 GRID_TEST_FRACTION: Final[float] = 0.10
 
+# Outer fold strategies for ``--test-split`` / ``--validation-split``.
+# ``protein`` = cold-protein; ``double-cold`` = protein+scaffold; ``time`` =
+# publication-year. When the two flags differ, test is carved first and val is
+# carved from the remainder.
+DEFAULT_TEST_SPLIT: Final[str] = "protein"
+DEFAULT_VALIDATION_SPLIT: Final[str] = "protein"
+
 # Random-forest defaults (warm-start incremental training).
 RF_DEFAULTS: Final[dict[str, int]] = {
     "n_estimators": 200,

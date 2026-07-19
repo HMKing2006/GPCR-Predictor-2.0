@@ -1,11 +1,10 @@
-"""Train a single 50 nM binder / non-binder classifier.
+"""Train a single binder / non-binder classifier.
 
-Builds (or reuses) a compact feature snapshot, applies an 80/20 double-cold
-(protein + Murcko scaffold) split by default (or a percentage-based publication
-year time split with ``--split-mode time``), trains the requested model,
-prints classification metrics and novelty breakouts on the held-out test set,
-and saves the model as a joblib file. The core routines are imported by
-``grid_search.py``.
+Builds (or reuses) a compact feature snapshot, applies nested outer folds via
+``--test-split`` / ``--validation-split`` (both default to cold-protein), trains
+the requested model, prints classification metrics and novelty breakouts on the
+held-out test set, and saves the model as a joblib file. The core routines are
+imported by ``grid_search.py``.
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ from src.featurize import FeatureDataset, build_features
 from src.ligand_repr import canonical_ligand_repr
 from src.metrics import print_breakdowns, print_metrics
 from src.models import BaseRegressor, build_model
-from src.splits import get_or_create_time_split, train_test_split
+from src.splits import SPLIT_STRATEGIES, get_or_create_nested_split
 
 
 def collect_hyperparams(args: argparse.Namespace, model_type: str) -> dict[str, Any]:
@@ -204,10 +203,16 @@ def _resolve_split(
 ) -> dict[str, np.ndarray]:
     """Build the requested train/val/test split for a dataset.
 
+    Test is carved with ``args.test_split`` first; when ``include_val`` is
+    ``True``, validation is carved from the remainder with
+    ``args.validation_split`` (defaulting to the same strategy as test).
+
     Args:
         dataset: Feature dataset with group / year arrays on disk.
-        args: Parsed CLI arguments (expects ``split_mode``, fractions, seed).
-        include_val: Whether a validation fold is required.
+        args: Parsed CLI arguments (expects ``test_split``, ``validation_split``,
+            fractions, seed).
+        include_val: Whether a validation fold is required. When ``False``,
+            ``validation_split`` is ignored and all non-test rows go to train.
         verbose: Progress logging.
 
     Returns:
@@ -216,64 +221,43 @@ def _resolve_split(
     Raises:
         SystemExit: If a time split is requested without dated rows.
     """
-    if args.split_mode == "time":
+    test_split = getattr(args, "test_split", config.DEFAULT_TEST_SPLIT)
+    validation_split = getattr(
+        args, "validation_split", config.DEFAULT_VALIDATION_SPLIT
+    )
+
+    protein_groups = dataset.load_groups()
+    needs_dc = test_split == "double-cold" or (
+        include_val and validation_split == "double-cold"
+    )
+    needs_time = test_split == "time" or (
+        include_val and validation_split == "time"
+    )
+    scaffold_groups = dataset.load_scaffold_groups() if needs_dc else None
+    years = None
+    if needs_time:
         try:
             years = dataset.load_years()
         except FileNotFoundError as exc:
             raise SystemExit(str(exc)) from exc
-        if int(np.sum(years >= 0)) == 0:
-            raise SystemExit(
-                "Time split requires dated rows. Rebuild Papyrus as Parquet "
-                "(with Year) and rebuild features."
-            )
-        val_fraction = float(args.val_fraction)
-        if not include_val:
-            # Fold the temporal val window into train for two-way train/test.
-            return get_or_create_time_split(
-                years,
-                dataset.signature,
-                val_fraction=val_fraction,
-                test_fraction=float(args.test_fraction),
-                include_val=False,
-                seed=args.seed,
-                splits_dir=dataset.split_directory,
-                verbose=verbose,
-            )
-        return get_or_create_time_split(
-            years,
-            dataset.signature,
-            val_fraction=val_fraction,
-            test_fraction=float(args.test_fraction),
-            include_val=True,
-            seed=args.seed,
-            splits_dir=dataset.split_directory,
-            verbose=verbose,
-        )
 
-    protein_groups = dataset.load_groups()
-    scaffold_groups = dataset.load_scaffold_groups()
-    if include_val:
-        from src.splits import train_val_test_split
-
-        return train_val_test_split(
-            protein_groups,
-            scaffold_groups,
-            dataset.signature,
+    try:
+        return get_or_create_nested_split(
+            protein_groups=protein_groups,
+            signature=dataset.signature,
+            test_split=test_split,
+            validation_split=validation_split,
             val_fraction=float(args.val_fraction),
             test_fraction=float(args.test_fraction),
+            include_val=include_val,
+            scaffold_groups=scaffold_groups,
+            years=years,
             seed=args.seed,
             splits_dir=dataset.split_directory,
             verbose=verbose,
         )
-    return train_test_split(
-        protein_groups,
-        scaffold_groups,
-        dataset.signature,
-        test_fraction=float(args.test_fraction),
-        seed=args.seed,
-        splits_dir=dataset.split_directory,
-        verbose=verbose,
-    )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def run_training(args: argparse.Namespace) -> str:
@@ -356,18 +340,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=config.GRID_VAL_FRACTION,
         help=(
-            "Validation fraction (grid search; for --split-mode time also used "
-            "to place the temporal val year window, which is merged into train "
-            "in train.py)."
+            "Validation fraction of all rows (grid search). For time validation "
+            "this sizes the year window; in train.py the val fold is merged "
+            "into train unless grid search is used."
         ),
     )
     p.add_argument(
-        "--split-mode",
-        choices=["double-cold", "time"],
-        default="double-cold",
+        "--test-split",
+        choices=list(SPLIT_STRATEGIES),
+        default=config.DEFAULT_TEST_SPLIT,
         help=(
-            "Outer split strategy: double-cold protein+scaffold (default) or "
-            "percentage-based publication-year time split."
+            "Strategy for the held-out test fold: cold-protein (default), "
+            "double-cold protein+scaffold, or publication-year time."
+        ),
+    )
+    p.add_argument(
+        "--validation-split",
+        choices=list(SPLIT_STRATEGIES),
+        default=config.DEFAULT_VALIDATION_SPLIT,
+        help=(
+            "Strategy for the validation fold (default: protein). Test is "
+            "carved first; val is carved from the remainder when a val fold is "
+            "used. Example: --test-split time --validation-split protein."
         ),
     )
     p.add_argument("--seed", type=int, default=config.RANDOM_SEED)

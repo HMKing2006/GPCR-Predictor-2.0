@@ -1,10 +1,11 @@
-"""Search model types and hyperparameters with an 80/10/10 double-cold split.
+"""Search model types and hyperparameters with nested outer folds.
 
 Each candidate is trained on the train split and scored on the validation split,
 with metrics printed as soon as the candidate finishes. The candidate with the
 highest validation AUROC is finally evaluated on the held-out test split (with
-protein/scaffold novelty breakouts) and saved. Pass ``--split-mode time`` for a
-percentage-based publication-year split instead of double-cold.
+protein/scaffold novelty breakouts) and saved. Use ``--test-split`` /
+``--validation-split`` (both default to cold-protein); e.g.
+``--test-split time --validation-split protein``.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from typing import Any, Optional
 import config
 from src.featurize import build_features
 from src.models import BaseRegressor
+from src.splits import SPLIT_STRATEGIES
 from train import _resolve_split, evaluate_on_indices, fit_on_indices
 
 # Every entry inherits MLP defaults including early stopping; ``epochs`` is a
@@ -189,25 +191,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--seed", type=int, default=config.RANDOM_SEED)
     p.add_argument(
-        "--split-mode",
-        choices=["double-cold", "time"],
-        default="double-cold",
+        "--test-split",
+        choices=list(SPLIT_STRATEGIES),
+        default=config.DEFAULT_TEST_SPLIT,
         help=(
-            "Outer split strategy: double-cold protein+scaffold (default) or "
-            "percentage-based publication-year time split."
+            "Strategy for the held-out test fold: cold-protein (default), "
+            "double-cold protein+scaffold, or publication-year time."
+        ),
+    )
+    p.add_argument(
+        "--validation-split",
+        choices=list(SPLIT_STRATEGIES),
+        default=config.DEFAULT_VALIDATION_SPLIT,
+        help=(
+            "Strategy for the validation fold (default: protein). Test is "
+            "carved first; val is carved from the remainder."
         ),
     )
     p.add_argument(
         "--val-fraction",
         type=float,
         default=config.GRID_VAL_FRACTION,
-        help="Validation fraction (double-cold row target or temporal dated-row target).",
+        help="Validation fraction of all rows (strategy-dependent assignment).",
     )
     p.add_argument(
         "--test-fraction",
         type=float,
         default=config.GRID_TEST_FRACTION,
-        help="Test fraction (double-cold row target or temporal dated-row target).",
+        help="Test fraction of all rows (strategy-dependent assignment).",
     )
     p.add_argument("--output", default=None, help="Output joblib path for the best model.")
     p.add_argument(

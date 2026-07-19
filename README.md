@@ -4,12 +4,12 @@ Predicts whether a protein–ligand pair is an active binder (activity ≤ 50 nM
 BindingDB or Papyrus data. Ligands can be represented with MoLFormer-XL embeddings,
 Morgan/Avalon fingerprints, RDKit physicochemical descriptors, or any concatenation
 of those. Proteins are embedded with ESM-2. Ligand and protein vectors are cached
-in LMDB stores named after the components that produced them. Models are trained
-with a **double-cold** split by default (held-out proteins *and* Murcko scaffolds),
-or optionally a **percentage-based publication-year time split**. Evaluation reports
-AUROC/AUPRC plus known/unknown protein and scaffold breakouts. By default the
-feature vector is protein + ligand only (assay type, pH, and temperature are
-optional).
+in LMDB stores named after the components that produced them. Outer folds use
+independent ``--test-split`` / ``--validation-split`` strategies (both default to
+**cold-protein**); test is carved first, then validation from the remainder.
+Evaluation reports AUROC/AUPRC plus known/unknown protein and scaffold breakouts.
+By default the feature vector is protein + ligand only (assay type, pH, and
+temperature are optional).
 
 ## Setup
 
@@ -222,30 +222,41 @@ per-row orphan id so they never merge incorrectly.
 
 ## Splits
 
-**Default: double-cold** — train/val/test share neither proteins nor Murcko
-scaffolds (connected components of the protein–scaffold co-occurrence graph).
+Outer train/val/test folds are controlled by two flags (both default to
+``protein`` = cold-protein):
 
-**Optional: time** — `--split-mode time` derives year cutoffs from
-`--val-fraction` / `--test-fraction` over dated rows (missing years go to
-train). Exact percentages snap to year boundaries; the chosen years and actual
-sizes are printed.
+| Strategy | Meaning |
+|----------|---------|
+| `protein` | Train/val/test share no proteins |
+| `double-cold` | Share neither proteins nor Murcko scaffolds |
+| `time` | Publication-year cutoffs from `--val-fraction` / `--test-fraction` (missing years → train) |
+
+**Composition:** test is always carved with `--test-split` first; when a
+validation fold is used, `--validation-split` carves val from the remainder.
+`train.py` merges the val fold into train (two-way fit/test); `grid_search.py`
+keeps val for model selection.
 
 ```bash
+# Default: cold-protein test and val
+python grid_search.py --data data/train/Papyrus_full_prepared.parquet
+
+# Temporal test + cold-protein validation (select for protein transfer)
 python grid_search.py \
   --data data/train/Papyrus_full_prepared.parquet \
-  --split-mode time \
+  --test-split time \
+  --validation-split protein \
   --val-fraction 0.1 \
   --test-fraction 0.1 \
   --rebuild-features
 ```
 
-Requires a Papyrus Parquet rebuild that includes `Year` and a feature rebuild
-that writes `years.npy`.
+Time folds require a Papyrus Parquet rebuild that includes `Year` and a feature
+rebuild that writes `years.npy`.
 
 ## Training
 
 ```bash
-# Default: BindingDB, random forest, 80/20 double-cold split, protein+ligand only
+# Default: BindingDB, random forest, cold-protein test, protein+ligand only
 python train.py
 
 # Include assay type / pH / temperature features
@@ -254,8 +265,9 @@ python train.py --include-assay-context --rebuild-features
 # Papyrus++
 python train.py --data data/train/Papyrus_pp_prepared.parquet --rebuild-features
 
-# Temporal split (Papyrus with Year)
-python train.py --data data/train/Papyrus_pp_prepared.parquet --split-mode time --rebuild-features
+# Temporal test fold (Papyrus with Year); val merged into train in train.py
+python train.py --data data/train/Papyrus_pp_prepared.parquet \
+  --test-split time --rebuild-features
 
 # MLP with custom hyperparameters
 python train.py --model mlp --epochs 30 --hidden-dim 2048 --learning-rate 5e-4
@@ -281,9 +293,9 @@ MLP early stopping carves a holdout from the **training** split (~5% of train
 rows by target). It prefers a **double-cold** holdout (no protein or scaffold
 overlap with the fit set). If that holdout is too small — common when the
 protein–scaffold graph forms a giant connected component — it falls back to a
-**cold-protein** holdout. This applies for both double-cold and temporal outer
-splits; under `--split-mode time`, early stopping is therefore not itself a
-future-year holdout (the outer val/test folds remain temporal).
+**cold-protein** holdout. This inner ES carve is independent of
+`--test-split` / `--validation-split` (e.g. a temporal test fold does not make
+early stopping itself a future-year holdout).
 
 By default the MLP uses **class weights**: BCE `pos_weight = n_neg / n_pos` on
 the fit rows (inverse class frequency). Disable with `--no-class-weights`.
@@ -291,14 +303,15 @@ the fit rows (inverse class frequency). Disable with `--no-class-weights`.
 ## Grid search
 
 ```bash
-# BindingDB (default)
+# BindingDB (default: cold-protein test + val)
 python grid_search.py
 
 # Papyrus++
 python grid_search.py --data data/train/Papyrus_pp_prepared.parquet --rebuild-features
 
-# Time split with novelty breakouts on the final test set
-python grid_search.py --data data/train/Papyrus_pp_prepared.parquet --split-mode time --rebuild-features
+# Temporal test + cold-protein val (select for protein transfer)
+python grid_search.py --data data/train/Papyrus_pp_prepared.parquet \
+  --test-split time --validation-split protein --rebuild-features
 
 # Include assay context
 python grid_search.py --include-assay-context --rebuild-features
@@ -310,9 +323,9 @@ python grid_search.py --include-rf
 python grid_search.py --no-class-weights
 ```
 
-Iterates over MLP hyperparameter combinations (and optionally RF baselines) using
-an 80/10/10 double-cold split by default (or temporal fractions with
-`--split-mode time`), prints each candidate's validation AUROC as it finishes,
+Iterates over MLP hyperparameter combinations (and optionally RF baselines)
+using nested `--test-split` / `--validation-split` folds (both default to
+cold-protein), prints each candidate's validation AUROC as it finishes,
 evaluates the best model on test with novelty breakouts, and saves to `models/`.
 MLP candidates inherit early stopping and `class_weights` (BCE
 `pos_weight = n_neg / n_pos`) from `config.MLP_DEFAULTS` unless overridden.
@@ -358,8 +371,10 @@ Defaults:
 - **Family vocab:** ChEMBL protein `Classification` level-2 tokens
 - **Target vocab:** `target_id`s with ≥10 active ligands, top 1024 by count
 - **Positives:** same binder rule as pair training; negatives are implicit zeros
-- **Splits:** Murcko-scaffold cold on ligands (default), or `--split-mode time`
-  with percentage year cutoffs; per-ligand year is the **max** among its active
+- **Splits:** nested ``--test-split`` / ``--validation-split`` with
+  ``scaffold`` (Murcko-cold, default) or ``time`` (percentage year cutoffs);
+  test is carved first, then val from the remainder (merged into train by
+  ``train_multilabel``). Per-ligand year is the **max** among its active
   annotations (undated → train)
 
 ```bash
@@ -367,16 +382,17 @@ Defaults:
 python build_papyrus_multilabel.py \
   --activity-source data/train/Papyrus_full_binary_prepared.parquet
 
-# Train (scaffold-cold default)
+# Train (scaffold-cold test + val defaults)
 python train_multilabel.py --task family --rebuild-features
 python train_multilabel.py --task target --rebuild-features
 
-# Time split (same fraction flags as pair train.py)
-python train_multilabel.py --task family --split-mode time \
+# Temporal test + scaffold-cold validation carve (val merged into train)
+python train_multilabel.py --task family \
+  --test-split time --validation-split scaffold \
   --val-fraction 0.1 --test-fraction 0.2 --rebuild-features
 
 # Predict (full vocab columns, or --top-k)
-python predict_multilabel.py --model models/multilabel/family_multilabel__scaffold.joblib \
+python predict_multilabel.py --model models/multilabel/family_multilabel__test-scaffold__val-scaffold.joblib \
   --ligand "CCO" --top-k 10 --output family_preds.csv
 ```
 
@@ -390,7 +406,7 @@ src/lmdb_cache.py    Embedding cache with model-derived DB names.
 src/embeddings.py    ESM-2 and MoLFormer-XL embedders.
 src/ligand_repr.py   Fingerprints, descriptors, composite ligand reps.
 src/featurize.py     Compact feature snapshots + on-demand FeatureView.
-src/splits.py        Double-cold and percentage time splits with save/reuse.
+src/splits.py        Nested test/val strategies (protein, double-cold, time).
 src/models.py        Warm-start RF + torch MLP classifiers.
 src/metrics.py       Classification metrics + novelty breakouts.
 src/io_utils.py      Spreadsheet / SMILES / SDF / FASTA IO.

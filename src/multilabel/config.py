@@ -36,6 +36,12 @@ VAL_FRACTION: Final[float] = root_config.GRID_VAL_FRACTION
 ACTIVITY_THRESHOLD_NM: Final[float] = root_config.ACTIVITY_THRESHOLD_NM
 DEFAULT_LIGAND_MODEL: Final[str] = "molformer"
 
+# Outer fold strategies for ``--test-split`` / ``--validation-split``.
+# ``scaffold`` = Murcko-scaffold cold; ``time`` = publication-year.
+SPLIT_STRATEGIES: Final[tuple[str, ...]] = ("scaffold", "time")
+DEFAULT_TEST_SPLIT: Final[str] = "scaffold"
+DEFAULT_VALIDATION_SPLIT: Final[str] = "scaffold"
+
 # Multilabel MLP defaults (ligand-only trunk; no bilinear / protein slice).
 MLP_DEFAULTS: Final[dict[str, Any]] = {
     "hidden_dim": int(root_config.MLP_DEFAULTS["hidden_dim"]),

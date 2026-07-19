@@ -2,8 +2,11 @@
 
 A *double-cold* split guarantees that train/val/test share neither proteins nor
 Murcko scaffolds: rows are partitioned by connected components of the
-protein–scaffold co-occurrence graph. A *cold protein* split only enforces
-protein disjointness.
+protein–scaffold co-occurrence graph. A *cold protein* (``protein``) split only
+enforces protein disjointness. A *time* split partitions by publication year.
+
+Outer folds can use independent strategies: ``test`` is carved first, then
+``val`` is carved from the remainder (when a validation fold is requested).
 
 Splits are cached under the dataset's ``cache/datasets/<stem>/splits`` folder.
 Filenames describe the strategy while embedded metadata binds each file to the
@@ -18,6 +21,9 @@ from typing import Callable, Optional
 import numpy as np
 
 import config
+
+# Supported outer-fold strategies for ``--test-split`` / ``--validation-split``.
+SPLIT_STRATEGIES: tuple[str, ...] = ("protein", "double-cold", "time")
 
 
 def _assign_blocks_to_splits(
@@ -619,3 +625,342 @@ def get_or_create_time_split(
             f"missing_year={int(np.sum(years < 0))} | {sizes}"
         )
     return split
+
+
+def _validate_strategy(name: str, strategy: str) -> str:
+    """Return ``strategy`` if it is a known split strategy.
+
+    Args:
+        name: Flag or argument name for error messages.
+        strategy: Requested strategy token.
+
+    Returns:
+        The validated strategy string.
+
+    Raises:
+        ValueError: If ``strategy`` is not in :data:`SPLIT_STRATEGIES`.
+    """
+    strategy = str(strategy).strip()
+    if strategy not in SPLIT_STRATEGIES:
+        raise ValueError(
+            f"Unknown {name}={strategy!r}; choose one of {SPLIT_STRATEGIES}."
+        )
+    return strategy
+
+
+def _partition_pool(
+    pool: np.ndarray,
+    strategy: str,
+    fractions: dict[str, float],
+    *,
+    protein_groups: np.ndarray,
+    scaffold_groups: Optional[np.ndarray],
+    years: Optional[np.ndarray],
+    seed: int,
+) -> dict[str, np.ndarray]:
+    """Partition a pool of global row indices with one strategy.
+
+    Args:
+        pool: Global row indices to partition.
+        strategy: One of :data:`SPLIT_STRATEGIES`.
+        fractions: Mapping from fold name to target fraction within ``pool``.
+        protein_groups: Full-dataset protein group ids.
+        scaffold_groups: Full-dataset scaffold ids (required for double-cold).
+        years: Full-dataset years (required for time); ``-1`` when missing.
+        seed: Random seed for block assignment strategies.
+
+    Returns:
+        Mapping from fold name to sorted global row-index arrays.
+
+    Raises:
+        ValueError: If a required array is missing for ``strategy``.
+    """
+    pool = np.asarray(pool, dtype=np.int64)
+    if pool.size == 0:
+        return {name: np.empty(0, dtype=np.int64) for name in fractions}
+
+    protein_groups = np.asarray(protein_groups)
+    strategy = _validate_strategy("strategy", strategy)
+
+    if strategy == "protein":
+        local = cold_protein_split(protein_groups[pool], fractions, seed=seed)
+    elif strategy == "double-cold":
+        if scaffold_groups is None:
+            raise ValueError("double-cold splits require scaffold_groups.")
+        local = double_cold_split(
+            protein_groups[pool],
+            np.asarray(scaffold_groups)[pool],
+            fractions,
+            seed=seed,
+        )
+    else:  # time
+        if years is None:
+            raise ValueError("time splits require years.")
+        years_arr = np.asarray(years)
+        names = set(fractions)
+        if names == {"train", "test"}:
+            val_year, test_year = year_cutoffs_from_fractions(
+                years_arr[pool], 0.0, float(fractions["test"])
+            )
+            local = time_split(
+                years_arr[pool], val_year, test_year, include_val=False
+            )
+        elif names == {"train", "val"}:
+            val_year, test_year = year_cutoffs_from_fractions(
+                years_arr[pool], 0.0, float(fractions["val"])
+            )
+            two_way = time_split(
+                years_arr[pool], val_year, test_year, include_val=False
+            )
+            local = {"train": two_way["train"], "val": two_way["test"]}
+        elif names == {"train", "val", "test"}:
+            val_year, test_year = year_cutoffs_from_fractions(
+                years_arr[pool],
+                float(fractions["val"]),
+                float(fractions["test"]),
+            )
+            local = time_split(
+                years_arr[pool], val_year, test_year, include_val=True
+            )
+        else:
+            raise ValueError(
+                f"Unsupported time-split fraction keys: {sorted(fractions)}"
+            )
+
+    return {
+        name: np.sort(pool[local_idx]).astype(np.int64)
+        for name, local_idx in local.items()
+    }
+
+
+def _build_nested_split(
+    *,
+    test_split: str,
+    validation_split: str,
+    protein_groups: np.ndarray,
+    scaffold_groups: Optional[np.ndarray],
+    years: Optional[np.ndarray],
+    val_fraction: float,
+    test_fraction: float,
+    include_val: bool,
+    seed: int,
+) -> dict[str, np.ndarray]:
+    """Build train/val/test by carving test first, then val from the remainder.
+
+    Args:
+        test_split: Strategy for the test fold.
+        validation_split: Strategy for the validation fold (ignored when
+            ``include_val`` is ``False``).
+        protein_groups: Per-row protein group ids.
+        scaffold_groups: Per-row scaffold ids (for double-cold).
+        years: Per-row years (for time); ``-1`` when missing.
+        val_fraction: Target fraction of *all* rows for validation.
+        test_fraction: Target fraction of *all* rows for test.
+        include_val: If ``False``, return only train/test (remainder → train).
+        seed: Random seed.
+
+    Returns:
+        Split mapping with ``train`` / ``test``, and ``val`` when requested.
+
+    Raises:
+        ValueError: If fractions are invalid or a required array is missing.
+    """
+    test_split = _validate_strategy("test_split", test_split)
+    validation_split = _validate_strategy("validation_split", validation_split)
+    if val_fraction < 0.0 or test_fraction < 0.0:
+        raise ValueError("val_fraction and test_fraction must be non-negative.")
+    if include_val and val_fraction + test_fraction >= 1.0:
+        raise ValueError("val_fraction + test_fraction must be < 1.0.")
+    if not include_val and test_fraction >= 1.0:
+        raise ValueError("test_fraction must be < 1.0.")
+
+    protein_groups = np.asarray(protein_groups)
+    n = int(protein_groups.shape[0])
+    all_idx = np.arange(n, dtype=np.int64)
+
+    # Matched time strategies: keep legacy year-window semantics (val_fraction
+    # sizes the middle year band even when it is later merged into train).
+    if test_split == "time" and validation_split == "time":
+        if years is None:
+            raise ValueError("time splits require years.")
+        val_year, test_year = year_cutoffs_from_fractions(
+            np.asarray(years), val_fraction, test_fraction
+        )
+        return time_split(
+            np.asarray(years), val_year, test_year, include_val=include_val
+        )
+
+    # Same-strategy three-way keeps a single atomic partition (matches legacy
+    # double-cold / protein train-val-test behavior more closely).
+    if include_val and test_split == validation_split:
+        fractions = {
+            "train": 1.0 - val_fraction - test_fraction,
+            "val": val_fraction,
+            "test": test_fraction,
+        }
+        return _partition_pool(
+            all_idx,
+            test_split,
+            fractions,
+            protein_groups=protein_groups,
+            scaffold_groups=scaffold_groups,
+            years=years,
+            seed=seed,
+        )
+
+    if (not include_val) and test_split == validation_split:
+        fractions = {"train": 1.0 - test_fraction, "test": test_fraction}
+        return _partition_pool(
+            all_idx,
+            test_split,
+            fractions,
+            protein_groups=protein_groups,
+            scaffold_groups=scaffold_groups,
+            years=years,
+            seed=seed,
+        )
+
+    # Mixed strategies (or val unused): carve test first, then optionally val.
+    rest_frac = 1.0 - test_fraction
+    step1 = _partition_pool(
+        all_idx,
+        test_split,
+        {"train": rest_frac, "test": test_fraction},
+        protein_groups=protein_groups,
+        scaffold_groups=scaffold_groups,
+        years=years,
+        seed=seed,
+    )
+    pool = step1["train"]
+    test_idx = step1["test"]
+
+    if not include_val:
+        return {"train": pool, "test": test_idx}
+
+    pool_n = int(pool.shape[0])
+    if pool_n == 0:
+        return {
+            "train": np.empty(0, dtype=np.int64),
+            "val": np.empty(0, dtype=np.int64),
+            "test": test_idx,
+        }
+    val_rel = float(val_fraction) * n / float(pool_n)
+    val_rel = float(min(max(val_rel, 0.0), 0.99))
+    step2 = _partition_pool(
+        pool,
+        validation_split,
+        {"train": 1.0 - val_rel, "val": val_rel},
+        protein_groups=protein_groups,
+        scaffold_groups=scaffold_groups,
+        years=years,
+        seed=seed + 1,
+    )
+    return {
+        "train": step2["train"],
+        "val": step2["val"],
+        "test": test_idx,
+    }
+
+
+def get_or_create_nested_split(
+    *,
+    protein_groups: np.ndarray,
+    signature: str,
+    test_split: str = config.DEFAULT_TEST_SPLIT,
+    validation_split: str = config.DEFAULT_VALIDATION_SPLIT,
+    val_fraction: float = config.GRID_VAL_FRACTION,
+    test_fraction: float = config.GRID_TEST_FRACTION,
+    include_val: bool = True,
+    scaffold_groups: Optional[np.ndarray] = None,
+    years: Optional[np.ndarray] = None,
+    seed: int = config.RANDOM_SEED,
+    splits_dir: str = config.SPLITS_DIR,
+    verbose: bool = True,
+) -> dict[str, np.ndarray]:
+    """Return a cached nested train/val/test split or create a new one.
+
+    Args:
+        protein_groups: Per-row protein group ids.
+        signature: Dataset signature for cache binding.
+        test_split: Strategy for the test fold (``protein``, ``double-cold``,
+            or ``time``).
+        validation_split: Strategy for the validation fold. Ignored when
+            ``include_val`` is ``False`` (remainder after test → train). When
+            equal to ``test_split``, a single joint partition is used.
+        val_fraction: Target fraction of all rows for validation.
+        test_fraction: Target fraction of all rows for test.
+        include_val: If ``False``, return train/test only.
+        scaffold_groups: Required when either strategy is ``double-cold``.
+        years: Required when either strategy is ``time``; ``-1`` if missing.
+        seed: Random seed for cold / double-cold assignment.
+        splits_dir: Directory for split cache files.
+        verbose: If ``True``, print reuse/create messages.
+
+    Returns:
+        Split mapping with ``train`` / ``test``, and ``val`` when requested.
+
+    Raises:
+        ValueError: If strategies/fractions are invalid or required inputs for
+            a strategy are missing.
+    """
+    test_split = _validate_strategy("test_split", test_split)
+    validation_split = _validate_strategy("validation_split", validation_split)
+    needs_time = test_split == "time" or (
+        include_val and validation_split == "time"
+    )
+    needs_dc = test_split == "double-cold" or (
+        include_val and validation_split == "double-cold"
+    )
+    if needs_time and years is None:
+        raise ValueError(
+            "Time split requires dated rows. Rebuild Papyrus as Parquet "
+            "(with Year) and rebuild features."
+        )
+    if needs_time:
+        years_arr = np.asarray(years)
+        if int(np.sum(years_arr >= 0)) == 0:
+            raise ValueError(
+                "Time split requires dated rows. Rebuild Papyrus as Parquet "
+                "(with Year) and rebuild features."
+            )
+    else:
+        years_arr = None
+    if needs_dc and scaffold_groups is None:
+        raise ValueError("double-cold splits require scaffold_groups.")
+
+    protein_groups = np.asarray(protein_groups)
+    n = int(protein_groups.shape[0])
+    effective_val = validation_split if include_val else test_split
+    split_type = (
+        f"nested__test-{test_split}__val-{effective_val}"
+        f"__val{100.0 * val_fraction:g}pct"
+        f"__test{100.0 * test_fraction:g}pct"
+        + ("" if include_val else "__val-merged")
+    )
+
+    def _builder() -> dict[str, np.ndarray]:
+        """Build the nested split for caching."""
+        return _build_nested_split(
+            test_split=test_split,
+            validation_split=validation_split,
+            protein_groups=protein_groups,
+            scaffold_groups=scaffold_groups,
+            years=years_arr,
+            val_fraction=val_fraction,
+            test_fraction=test_fraction,
+            include_val=include_val,
+            seed=seed,
+        )
+
+    return _get_or_create_split(
+        n_rows=n,
+        signature=signature,
+        split_type=split_type,
+        seed=seed,
+        splits_dir=splits_dir,
+        verbose=verbose,
+        builder=_builder,
+        created_detail=(
+            f"test_split={test_split} validation_split={validation_split}"
+        ),
+    )
