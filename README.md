@@ -345,6 +345,41 @@ at most 50 nM (matching the training threshold). Spreadsheet outputs are named
 reloads the ligand representation and assay-context setting from the saved
 model's metadata.
 
+## Ligand multilabel (experimental)
+
+Isolated ligand-centric **family** and **target** multilabel models under
+`src/multilabel/`. They do **not** change the pair binder pipeline
+(`train.py` / `grid_search.py` / `predict.py` / `src/models.py`). Delete
+`src/multilabel/`, `build_papyrus_multilabel.py`, `train_multilabel.py`,
+`predict_multilabel.py`, and `models/multilabel/` to remove the stack.
+
+Defaults:
+
+- **Family vocab:** ChEMBL protein `Classification` level-2 tokens
+- **Target vocab:** `target_id`s with ≥10 active ligands, top 1024 by count
+- **Positives:** same binder rule as pair training; negatives are implicit zeros
+- **Splits:** Murcko-scaffold cold on ligands (default), or `--split-mode time`
+  with percentage year cutoffs; per-ligand year is the **max** among its active
+  annotations (undated → train)
+
+```bash
+# Build prepared ligand tables + vocab sidecars from pair prepared Parquet
+python build_papyrus_multilabel.py \
+  --activity-source data/train/Papyrus_full_binary_prepared.parquet
+
+# Train (scaffold-cold default)
+python train_multilabel.py --task family --rebuild-features
+python train_multilabel.py --task target --rebuild-features
+
+# Time split (same fraction flags as pair train.py)
+python train_multilabel.py --task family --split-mode time \
+  --val-fraction 0.1 --test-fraction 0.2 --rebuild-features
+
+# Predict (full vocab columns, or --top-k)
+python predict_multilabel.py --model models/multilabel/family_multilabel__scaffold.joblib \
+  --ligand "CCO" --top-k 10 --output family_preds.csv
+```
+
 ## Project layout
 
 ```
@@ -362,4 +397,10 @@ src/io_utils.py      Spreadsheet / SMILES / SDF / FASTA IO.
 train.py             Train one model.
 grid_search.py       Search model types and hyperparameters.
 predict.py           Four prediction modes.
+
+# Experimental ligand multilabel (deletable)
+src/multilabel/              Isolated family/target multilabel package.
+build_papyrus_multilabel.py  Build ligand prepared tables + vocab.
+train_multilabel.py          Train family or target multilabel MLP.
+predict_multilabel.py        Ligand → multilabel probability vector.
 ```
