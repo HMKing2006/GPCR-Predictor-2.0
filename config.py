@@ -28,26 +28,29 @@ MODELS_DIR: Final[str] = os.path.join(PROJECT_ROOT, "models")
 FEATURES_DIR: Final[str] = os.path.join(CACHE_DIR, "features")
 DATASETS_CACHE_DIR: Final[str] = os.path.join(CACHE_DIR, "datasets")
 
-# --- Default embedding models ------------------------------------------------
+# --- Default embedding / ligand representation -------------------------------
 
 DEFAULT_PROTEIN_MODEL: Final[str] = "facebook/esm2_t33_650M_UR50D"
-DEFAULT_LIGAND_MODEL: Final[str] = "ibm-research/MoLFormer-XL-both-10pct"
+# Default ``--ligand-model`` spec (comma-separated tokens allowed).
+DEFAULT_LIGAND_MODEL: Final[str] = "morgan,descriptors"
+# Hugging Face id used when ``molformer`` appears in a ligand-model spec.
+MOLFORMER_MODEL_ID: Final[str] = "ibm-research/MoLFormer-XL-both-10pct"
 
-# Embedding dimensionalities for the default models. These are validated at
+# Embedding dimensionalities for the default HF models. These are validated at
 # runtime against the actual model output and only used for pre-allocation.
 PROTEIN_EMB_DIM: Final[int] = 1280
-LIGAND_EMB_DIM: Final[int] = 768
+LIGAND_EMB_DIM: Final[int] = 768  # MoLFormer-XL; fingerprint dims are dynamic
 
 # Models that ship custom modeling code on the Hub and must be loaded with
 # ``trust_remote_code=True`` (e.g. MoLFormer's linear-attention implementation).
 TRUST_REMOTE_CODE_MODELS: Final[tuple[str, ...]] = (
-    "ibm-research/MoLFormer-XL-both-10pct",
+    MOLFORMER_MODEL_ID,
     "ibm/MoLFormer-XL-both-10pct",
 )
 
 # --- Ligand representation tokens --------------------------------------------
 # Reserved tokens for ``--ligand-model`` (comma-separated combinations allowed).
-# ``molformer`` aliases ``DEFAULT_LIGAND_MODEL``; any other token is treated as a
+# ``molformer`` aliases ``MOLFORMER_MODEL_ID``; any other token is treated as a
 # Hugging Face SMILES transformer id (or rejected if unrecognized).
 LIGAND_REPR_TOKENS: Final[tuple[str, ...]] = (
     "morgan",

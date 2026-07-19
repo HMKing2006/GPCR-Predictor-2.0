@@ -1,9 +1,9 @@
 # GPCR Binder Classifier 2.0
 
 Predicts whether a protein–ligand pair is an active binder (activity ≤ 50 nM) from
-BindingDB or Papyrus data. Ligands can be represented with MoLFormer-XL embeddings,
-Morgan/Avalon fingerprints, RDKit physicochemical descriptors, or any concatenation
-of those. Proteins are embedded with ESM-2. Ligand and protein vectors are cached
+BindingDB or Papyrus data. Ligands default to Morgan fingerprints + RDKit
+descriptors (MoLFormer-XL and other reps are available via ``--ligand-model``).
+Proteins are embedded with ESM-2. Ligand and protein vectors are cached
 in LMDB stores named after the components that produced them. Outer folds use
 independent ``--test-split`` / ``--validation-split`` strategies (both default to
 **cold-protein**); test is carved first, then validation from the remainder.
@@ -21,7 +21,9 @@ The default embedding models are downloaded automatically from the Hugging Face
 Hub on first use:
 
 - Protein: `facebook/esm2_t33_650M_UR50D` (1280-d)
-- Ligand: `ibm-research/MoLFormer-XL-both-10pct` (768-d, loaded with `trust_remote_code=True`)
+- Ligand (default): Morgan (2048-d) + RDKit descriptors (217-d). Optional HF ligand
+  model: `ibm-research/MoLFormer-XL-both-10pct` (768-d, `trust_remote_code=True`)
+  via `--ligand-model molformer`.
 
 [Papyrus](https://doi.org/10.1186/s13321-022-00672-x) support requires
 `papyrus-scripts` and `pyarrow` (both in `requirements.txt`).
@@ -211,7 +213,7 @@ successful rebuild, obsolete `cache/features/`, `data/splits/`, `X.dat`, and
 
 Assay one-hot order is fixed in `config.ASSAY_TYPES`: IC50, EC50, Ki, Kd, Other.
 
-With the default MoLFormer ligand representation and assay context off this is
+With the default Morgan + descriptors ligand representation and assay context off this is
 `concat(protein[1280], ligand[768])`. With assay context enabled it becomes
 `concat(protein[1280], ligand[768], assay[5], pH, temp)`. With combined
 fingerprints, `ligand` is the concatenation of each selected component.

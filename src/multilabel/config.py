@@ -34,7 +34,7 @@ RANDOM_SEED: Final[int] = root_config.RANDOM_SEED
 TEST_FRACTION: Final[float] = root_config.TEST_FRACTION
 VAL_FRACTION: Final[float] = root_config.GRID_VAL_FRACTION
 ACTIVITY_THRESHOLD_NM: Final[float] = root_config.ACTIVITY_THRESHOLD_NM
-DEFAULT_LIGAND_MODEL: Final[str] = "molformer"
+DEFAULT_LIGAND_MODEL: Final[str] = "morgan,descriptors"
 
 # Outer fold strategies for ``--test-split`` / ``--validation-split``.
 # ``scaffold`` = Murcko-scaffold cold; ``time`` = publication-year.

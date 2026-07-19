@@ -11,7 +11,7 @@ import numpy as np
 from src.ligand_repr import canonical_ligand_repr
 from src.multilabel import config as ml_config
 from src.multilabel.featurize import build_ligand_features, default_paths_for_task
-from src.multilabel.metrics import print_multilabel_metrics
+from src.multilabel.metrics import print_multilabel_metrics, write_per_label_metrics
 from src.multilabel.models import MultilabelMLP
 from src.multilabel.splits import SPLIT_STRATEGIES, get_or_create_nested_split
 from src.multilabel.vocab import load_vocab
@@ -175,6 +175,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output joblib path (default under models/multilabel/).",
     )
+    parser.add_argument(
+        "--label-metrics",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Optional spreadsheet path for per-label test metrics "
+            "(AUROC, AUPRC, Precision, Recall, active_frac). "
+            "Extension selects format (.xlsx/.csv/.tsv)."
+        ),
+    )
     parser.add_argument("--hidden-dim", type=int, default=int(defaults["hidden_dim"]))
     parser.add_argument("--num-layers", type=int, default=int(defaults["num_layers"]))
     parser.add_argument("--dropout", type=float, default=float(defaults["dropout"]))
@@ -282,6 +292,15 @@ def main(argv: Optional[list[str]] = None) -> None:
     probs = model.predict(X_test)
     del X_test
     print_multilabel_metrics(y_test, probs, label="test", vocab=vocab)
+    if args.label_metrics:
+        write_per_label_metrics(
+            args.label_metrics,
+            y_test,
+            probs,
+            vocab=vocab,
+        )
+        if verbose:
+            print(f"[train] wrote label metrics to {args.label_metrics}", flush=True)
 
     output = args.output
     if output is None:

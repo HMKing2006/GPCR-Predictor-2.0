@@ -1,7 +1,7 @@
 """Ligand representation featurizers and multi-component composition.
 
 Supports reserved RDKit tokens (``morgan``, ``avalon``, ``descriptors``), the
-``molformer`` alias for the default Hugging Face ligand model, arbitrary HF
+``molformer`` alias for MoLFormer-XL, arbitrary HF
 SMILES transformers, and comma-separated combinations thereof. Each component
 writes to its own LMDB cache store; composites concatenate vectors in CLI order.
 """
@@ -520,7 +520,7 @@ def _canonical_token(token: str) -> str:
         token: One comma-separated piece of ``--ligand-model``.
 
     Returns:
-        The canonical token string (``molformer`` expands to the default HF id).
+        The canonical token string (``molformer`` expands to MoLFormer-XL).
 
     Raises:
         ValueError: If the token is empty or unrecognized.
@@ -530,14 +530,14 @@ def _canonical_token(token: str) -> str:
         raise ValueError("Empty ligand representation token in --ligand-model.")
     lower = t.lower()
     if lower == "molformer":
-        return config.DEFAULT_LIGAND_MODEL
+        return config.MOLFORMER_MODEL_ID
     if lower in ("morgan", "avalon", "descriptors"):
         return lower
     # Hugging Face model ids typically contain "/"; also allow bare ids that are
     # not reserved tokens (backward-compatible with a single HF model string).
     if lower in config.LIGAND_REPR_TOKENS:
         return lower
-    if "/" in t or t == config.DEFAULT_LIGAND_MODEL:
+    if "/" in t or t == config.MOLFORMER_MODEL_ID:
         return t
     # Accept any other non-reserved string as an HF model id (current behavior).
     return t

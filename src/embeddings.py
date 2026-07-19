@@ -240,13 +240,13 @@ def protein_embedder(
 
 
 def ligand_embedder(
-    model_id: str = config.DEFAULT_LIGAND_MODEL,
+    model_id: str = config.MOLFORMER_MODEL_ID,
     device: Optional[torch.device] = None,
 ) -> HFEmbedder:
-    """Construct the default ligand (MoLFormer-XL) embedder.
+    """Construct a Hugging Face ligand (SMILES) embedder.
 
     Args:
-        model_id: SMILES transformer model identifier.
+        model_id: SMILES transformer model identifier (default: MoLFormer-XL).
         device: Torch device; auto-selected when ``None``.
 
     Returns:
