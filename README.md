@@ -366,7 +366,8 @@ Isolated ligand-centric **family** and **target** multilabel models under
 `src/multilabel/`. They do **not** change the pair binder pipeline
 (`train.py` / `grid_search.py` / `predict.py` / `src/models.py`). Delete
 `src/multilabel/`, `build_papyrus_multilabel.py`, `train_multilabel.py`,
-`predict_multilabel.py`, and `models/multilabel/` to remove the stack.
+`grid_search_multilabel.py`, `predict_multilabel.py`, and `models/multilabel/`
+to remove the stack.
 
 Defaults:
 
@@ -376,8 +377,8 @@ Defaults:
 - **Splits:** nested ``--test-split`` / ``--validation-split`` with
   ``scaffold`` (Murcko-cold, default) or ``time`` (percentage year cutoffs);
   test is carved first, then val from the remainder (merged into train by
-  ``train_multilabel``). Per-ligand year is the **max** among its active
-  annotations (undated → train)
+  ``train_multilabel``; kept for selection by ``grid_search_multilabel``).
+  Per-ligand year is the **max** among its active annotations (undated → train)
 
 ```bash
 # Build prepared ligand tables + vocab sidecars from pair prepared Parquet
@@ -392,6 +393,11 @@ python train_multilabel.py --task target --rebuild-features
 python train_multilabel.py --task family \
   --test-split time --validation-split scaffold \
   --val-fraction 0.1 --test-fraction 0.2 --rebuild-features
+
+# Grid search (select by val micro-AUPRC; optional per-label test spreadsheet)
+python grid_search_multilabel.py --task family \
+  --test-split time --validation-split scaffold \
+  --label-metrics models/multilabel/family_grid_label_metrics.xlsx
 
 # Predict (full vocab columns, or --top-k)
 python predict_multilabel.py --model models/multilabel/family_multilabel__test-scaffold__val-scaffold.joblib \
@@ -420,5 +426,6 @@ predict.py           Four prediction modes.
 src/multilabel/              Isolated family/target multilabel package.
 build_papyrus_multilabel.py  Build ligand prepared tables + vocab.
 train_multilabel.py          Train family or target multilabel MLP.
+grid_search_multilabel.py    Grid-search multilabel MLPs (val micro-AUPRC).
 predict_multilabel.py        Ligand → multilabel probability vector.
 ```

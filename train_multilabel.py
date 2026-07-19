@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import numpy as np
 
 from src.ligand_repr import canonical_ligand_repr
 from src.multilabel import config as ml_config
 from src.multilabel.featurize import build_ligand_features, default_paths_for_task
-from src.multilabel.metrics import print_multilabel_metrics, write_per_label_metrics
+from src.multilabel.metrics import (
+    compute_multilabel_metrics,
+    print_multilabel_metrics,
+    write_per_label_metrics,
+)
 from src.multilabel.models import MultilabelMLP
 from src.multilabel.splits import SPLIT_STRATEGIES, get_or_create_nested_split
 from src.multilabel.vocab import load_vocab
@@ -40,16 +44,23 @@ def collect_hyperparams(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _resolve_split(dataset, args: argparse.Namespace) -> dict[str, np.ndarray]:
+def _resolve_split(
+    dataset,
+    args: argparse.Namespace,
+    *,
+    include_val: bool = False,
+) -> dict[str, np.ndarray]:
     """Create or reuse nested scaffold/time outer folds.
 
-    Test is carved with ``args.test_split`` first. ``train_multilabel`` merges
-    any validation fold into train (``include_val=False``), matching pair
-    ``train.py`` behavior.
+    Test is carved with ``args.test_split`` first. When ``include_val`` is
+    ``False`` (``train_multilabel`` default), the validation fold is merged
+    into train. Grid search passes ``include_val=True`` to keep a val fold.
 
     Args:
         dataset: Ligand feature dataset.
         args: Parsed CLI arguments.
+        include_val: If ``True``, return a ``val`` fold; otherwise merge it
+            into ``train``.
 
     Returns:
         Mapping with at least ``train`` and ``test`` index arrays.
@@ -59,7 +70,9 @@ def _resolve_split(dataset, args: argparse.Namespace) -> dict[str, np.ndarray]:
     """
     test_split = args.test_split
     validation_split = args.validation_split
-    needs_time = test_split == "time" or validation_split == "time"
+    needs_time = test_split == "time" or (
+        include_val and validation_split == "time"
+    )
     years = None
     if needs_time:
         try:
@@ -75,7 +88,7 @@ def _resolve_split(dataset, args: argparse.Namespace) -> dict[str, np.ndarray]:
             validation_split=validation_split,
             val_fraction=float(args.val_fraction),
             test_fraction=float(args.test_fraction),
-            include_val=False,
+            include_val=include_val,
             years=years,
             seed=args.seed,
             splits_dir=dataset.split_directory,
@@ -83,6 +96,129 @@ def _resolve_split(dataset, args: argparse.Namespace) -> dict[str, np.ndarray]:
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+
+
+def _build_model_metadata(
+    *,
+    dataset,
+    vocab: Sequence[str],
+    hyperparams: dict[str, Any],
+    args: argparse.Namespace,
+    vocab_path: str,
+) -> dict[str, Any]:
+    """Assemble metadata stored alongside a multilabel checkpoint.
+
+    Args:
+        dataset: Ligand feature dataset.
+        vocab: Ordered vocabulary strings.
+        hyperparams: Model hyperparameters.
+        args: Parsed CLI arguments.
+        vocab_path: Path to the vocabulary JSON.
+
+    Returns:
+        Metadata dictionary for :attr:`MultilabelMLP.metadata`.
+    """
+    return {
+        "task": f"{args.task}_multilabel",
+        "vocab_path": os.path.realpath(vocab_path),
+        "vocab": list(vocab),
+        "ligand_model": canonical_ligand_repr(args.ligand_model),
+        "ligand_dim": dataset.ligand_dim,
+        "n_features": dataset.n_features,
+        "n_labels": dataset.n_labels,
+        "hyperparams": hyperparams,
+        "activity_threshold_nm": dataset.activity_threshold_nm,
+        "feature_storage_version": ml_config.STORAGE_VERSION,
+        "feature_signature": dataset.signature,
+        "feature_directory": dataset.directory,
+        "ligand_embedding_aliases": list(dataset.ligand_aliases),
+        "test_split": args.test_split,
+        "validation_split": args.validation_split,
+    }
+
+
+def fit_multilabel_on_indices(
+    dataset,
+    train_idx: np.ndarray,
+    hyperparams: dict[str, Any],
+    *,
+    seed: int,
+    metadata: dict[str, Any],
+    verbose: bool = True,
+) -> MultilabelMLP:
+    """Fit a multilabel MLP on selected ligand rows.
+
+    Args:
+        dataset: Ligand feature dataset.
+        train_idx: Training row indices.
+        hyperparams: Hyperparameters for :class:`MultilabelMLP`.
+        seed: Random seed.
+        metadata: Checkpoint metadata to attach before fitting.
+        verbose: If ``True``, print progress.
+
+    Returns:
+        The fitted model.
+    """
+    train_idx = np.asarray(train_idx, dtype=np.int64)
+    X_train = dataset.feature_view(train_idx)
+    y_train = np.asarray(dataset.load_y()[train_idx], dtype=np.float32)
+    model = MultilabelMLP(n_labels=dataset.n_labels, seed=seed, **hyperparams)
+    model.metadata = dict(metadata)
+    if verbose:
+        mean_labels = float(y_train.sum(axis=1).mean()) if y_train.size else 0.0
+        print(
+            f"[train] fitting multilabel MLP on {len(train_idx)} ligands "
+            f"(K={dataset.n_labels}, mean_labels={mean_labels:.2f})",
+            flush=True,
+        )
+    model.fit(
+        X_train,
+        y_train,
+        verbose=verbose,
+        scaffold_groups=dataset.load_scaffold_groups()[train_idx],
+    )
+    del X_train
+    return model
+
+
+def evaluate_multilabel_on_indices(
+    model: MultilabelMLP,
+    dataset,
+    idx: np.ndarray,
+    vocab: Sequence[str],
+    *,
+    label: str = "eval",
+    verbose: bool = True,
+    label_metrics_path: Optional[str] = None,
+) -> dict[str, float]:
+    """Score a fitted multilabel model on selected rows.
+
+    Args:
+        model: Fitted multilabel MLP.
+        dataset: Ligand feature dataset.
+        idx: Evaluation row indices.
+        vocab: Ordered vocabulary for printing.
+        label: Prefix for printed metric lines.
+        verbose: If ``True``, print micro/macro and top/bottom labels.
+        label_metrics_path: Optional spreadsheet path for per-label metrics.
+
+    Returns:
+        Micro/macro metric mapping from :func:`compute_multilabel_metrics`.
+    """
+    idx = np.asarray(idx, dtype=np.int64)
+    X_eval = dataset.feature_view(idx)
+    y_eval = np.asarray(dataset.load_y()[idx], dtype=np.float32)
+    probs = model.predict(X_eval)
+    del X_eval
+    if verbose:
+        scores = print_multilabel_metrics(y_eval, probs, label=label, vocab=vocab)
+    else:
+        scores = compute_multilabel_metrics(y_eval, probs)
+    if label_metrics_path:
+        write_per_label_metrics(label_metrics_path, y_eval, probs, vocab=vocab)
+        if verbose:
+            print(f"[eval] wrote label metrics to {label_metrics_path}", flush=True)
+    return scores
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -246,61 +382,34 @@ def main(argv: Optional[list[str]] = None) -> None:
         rebuild=args.rebuild_features,
         verbose=verbose,
     )
-    split = _resolve_split(dataset, args)
-    train_idx = split["train"]
-    test_idx = split["test"]
+    split = _resolve_split(dataset, args, include_val=False)
     vocab = load_vocab(vocab_path)
     hyperparams = collect_hyperparams(args)
-
-    X_train = dataset.feature_view(train_idx)
-    y_train = np.asarray(dataset.load_y()[train_idx], dtype=np.float32)
-    model = MultilabelMLP(n_labels=dataset.n_labels, seed=args.seed, **hyperparams)
-    model.metadata = {
-        "task": f"{args.task}_multilabel",
-        "vocab_path": os.path.realpath(vocab_path),
-        "vocab": vocab,
-        "ligand_model": canonical_ligand_repr(args.ligand_model),
-        "ligand_dim": dataset.ligand_dim,
-        "n_features": dataset.n_features,
-        "n_labels": dataset.n_labels,
-        "hyperparams": hyperparams,
-        "activity_threshold_nm": dataset.activity_threshold_nm,
-        "feature_storage_version": ml_config.STORAGE_VERSION,
-        "feature_signature": dataset.signature,
-        "feature_directory": dataset.directory,
-        "ligand_embedding_aliases": list(dataset.ligand_aliases),
-        "test_split": args.test_split,
-        "validation_split": args.validation_split,
-    }
-    if verbose:
-        mean_labels = float(y_train.sum(axis=1).mean()) if y_train.size else 0.0
-        print(
-            f"[train] fitting multilabel MLP on {len(train_idx)} ligands "
-            f"(K={dataset.n_labels}, mean_labels={mean_labels:.2f})",
-            flush=True,
-        )
-    model.fit(
-        X_train,
-        y_train,
-        verbose=verbose,
-        scaffold_groups=dataset.load_scaffold_groups()[train_idx],
+    metadata = _build_model_metadata(
+        dataset=dataset,
+        vocab=vocab,
+        hyperparams=hyperparams,
+        args=args,
+        vocab_path=vocab_path,
     )
-    del X_train
+    model = fit_multilabel_on_indices(
+        dataset,
+        split["train"],
+        hyperparams,
+        seed=args.seed,
+        metadata=metadata,
+        verbose=verbose,
+    )
 
-    X_test = dataset.feature_view(test_idx)
-    y_test = np.asarray(dataset.load_y()[test_idx], dtype=np.float32)
-    probs = model.predict(X_test)
-    del X_test
-    print_multilabel_metrics(y_test, probs, label="test", vocab=vocab)
-    if args.label_metrics:
-        write_per_label_metrics(
-            args.label_metrics,
-            y_test,
-            probs,
-            vocab=vocab,
-        )
-        if verbose:
-            print(f"[train] wrote label metrics to {args.label_metrics}", flush=True)
+    evaluate_multilabel_on_indices(
+        model,
+        dataset,
+        split["test"],
+        vocab,
+        label="test",
+        verbose=True,
+        label_metrics_path=args.label_metrics,
+    )
 
     output = args.output
     if output is None:
