@@ -41,6 +41,7 @@ def collect_hyperparams(args: argparse.Namespace) -> dict[str, Any]:
         "patience": args.patience,
         "es_val_fraction": args.es_val_fraction,
         "class_weights": args.class_weights,
+        "active_fraction": args.active_fraction,
     }
 
 
@@ -343,6 +344,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=bool(defaults["class_weights"]),
         help="Per-label BCE pos_weight = n_neg/n_pos (default on).",
+    )
+    parser.add_argument(
+        "--active-fraction",
+        type=float,
+        default=defaults["active_fraction"],
+        help=(
+            "If set, keep a fixed per-label train mask so positives are "
+            "approximately this fraction of supervised cells (e.g. 0.3). "
+            "Early-stop and test metrics stay on the full multi-hot matrix."
+        ),
     )
     parser.add_argument("--quiet", action="store_true", help="Suppress progress.")
     return parser

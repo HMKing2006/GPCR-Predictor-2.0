@@ -412,6 +412,12 @@ Defaults:
 - **Family / target vocab:** labels need ≥``--min-positives`` unique active
   ligands (default **100**); targets are further capped at top 1024 by count
 - **Positives:** same binder rule as pair training; negatives are implicit zeros
+- **Class balance:** `--class-weights` (default on) sets per-label BCE
+  ``pos_weight = n_neg/n_pos``. Optional ``--active-fraction f`` builds a
+  **fixed per-label train mask** that downsamples negatives so positives are
+  ~``f`` of supervised cells (e.g. ``0.3``). Mask is train-loss only;
+  early-stop and outer-fold metrics use the full multi-hot matrix. When both
+  flags are on, ``pos_weight`` is recomputed on the masked counts.
 - **Splits:** nested ``--test-split`` / ``--validation-split`` with
   ``scaffold`` (Murcko-cold, default) or ``time`` (percentage year cutoffs);
   test is carved first, then val from the remainder (merged into train by
@@ -426,6 +432,9 @@ python build_papyrus_multilabel.py \
 # Train (scaffold-cold test + val defaults)
 python train_multilabel.py --task family --rebuild-features
 python train_multilabel.py --task target --rebuild-features
+
+# Downsample per-label train negatives to ~30% active cells
+python train_multilabel.py --task family --active-fraction 0.3 --rebuild-features
 
 # Temporal test + scaffold-cold validation carve (val merged into train)
 python train_multilabel.py --task family \

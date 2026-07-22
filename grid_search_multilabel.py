@@ -52,6 +52,7 @@ def _merge_defaults(overrides: dict[str, Any]) -> dict[str, Any]:
         "es_val_fraction": float(ml_config.MLP_DEFAULTS["es_val_fraction"]),
         "es_min_delta": float(ml_config.MLP_DEFAULTS["es_min_delta"]),
         "class_weights": bool(ml_config.MLP_DEFAULTS["class_weights"]),
+        "active_fraction": ml_config.MLP_DEFAULTS["active_fraction"],
     }
     base.update(overrides)
     return base
@@ -105,6 +106,7 @@ def run_grid_search(args: argparse.Namespace) -> str:
     for index, overrides in enumerate(NN_GRID):
         hyperparams = _merge_defaults(overrides)
         hyperparams["class_weights"] = bool(args.class_weights)
+        hyperparams["active_fraction"] = args.active_fraction
         desc = f"mlp {overrides}"
         print(f"\n[grid] ({index + 1}/{len(NN_GRID)}) training {desc}", flush=True)
         metadata = _build_model_metadata(
@@ -263,6 +265,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=bool(ml_config.MLP_DEFAULTS["class_weights"]),
         help="Per-label BCE pos_weight = n_neg/n_pos (default on).",
+    )
+    parser.add_argument(
+        "--active-fraction",
+        type=float,
+        default=ml_config.MLP_DEFAULTS["active_fraction"],
+        help=(
+            "If set, keep a fixed per-label train mask so positives are "
+            "approximately this fraction of supervised cells (e.g. 0.3). "
+            "Applied to every grid candidate; early-stop and test metrics "
+            "stay on the full multi-hot matrix."
+        ),
     )
     parser.add_argument("--quiet", action="store_true", help="Suppress progress.")
     return parser

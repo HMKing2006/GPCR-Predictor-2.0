@@ -70,6 +70,7 @@ MLP_DEFAULTS: Final[dict[str, Any]] = {
     "es_val_fraction": float(root_config.MLP_DEFAULTS["es_val_fraction"]),
     "es_min_delta": float(root_config.MLP_DEFAULTS["es_min_delta"]),
     "class_weights": True,
+    "active_fraction": None,
 }
 
 STORAGE_VERSION: Final[str] = "ligand_multilabel_v1"

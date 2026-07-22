@@ -19,6 +19,66 @@ from src.multilabel.splits import scaffold_cold_split
 _PREDICT_CHUNK: int = 50_000
 
 
+def build_active_fraction_mask(
+    y_fit: np.ndarray,
+    active_fraction: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Build a fixed per-label mask that downsamples negatives to a target density.
+
+    For each label, all positives are kept. Negatives are randomly subsampled
+    once so that ``n_pos / (n_pos + n_neg_kept)`` is approximately
+    ``active_fraction``. Labels already at or above that density keep every
+    negative. Labels with no positives keep all zeros (no sampling).
+
+    Args:
+        y_fit: Train label matrix ``(n_train, K)`` with values in ``{0, 1}``.
+        active_fraction: Target positive fraction in ``(0, 1]``.
+        rng: NumPy Generator used for the fixed negative draw.
+
+    Returns:
+        Boolean mask ``(n_train, K)`` where ``True`` cells contribute to BCE.
+
+    Raises:
+        ValueError: If ``active_fraction`` is outside ``(0, 1]`` or ``y_fit``
+            is not 2-D.
+    """
+    fraction = float(active_fraction)
+    if not (0.0 < fraction <= 1.0):
+        raise ValueError(
+            f"active_fraction must be in (0, 1], got {active_fraction!r}."
+        )
+    y_arr = np.asarray(y_fit)
+    if y_arr.ndim != 2:
+        raise ValueError(f"y_fit must be 2-D, got shape {y_arr.shape}.")
+    n_train, n_labels = y_arr.shape
+    positives = y_arr > 0.5
+    mask = positives.copy()
+    if fraction >= 1.0:
+        return mask
+    inv_ratio = (1.0 - fraction) / fraction
+    for label_idx in range(n_labels):
+        pos_rows = np.flatnonzero(positives[:, label_idx])
+        n_pos = int(pos_rows.shape[0])
+        if n_pos == 0:
+            continue
+        neg_rows = np.flatnonzero(~positives[:, label_idx])
+        n_neg = int(neg_rows.shape[0])
+        if n_neg == 0:
+            continue
+        density = n_pos / float(n_pos + n_neg)
+        if density >= fraction:
+            mask[neg_rows, label_idx] = True
+            continue
+        n_neg_keep = int(round(n_pos * inv_ratio))
+        n_neg_keep = max(0, min(n_neg, n_neg_keep))
+        if n_neg_keep == 0:
+            continue
+        chosen = rng.choice(neg_rows, size=n_neg_keep, replace=False)
+        mask[chosen, label_idx] = True
+    return mask
+
+
 class _MultilabelMLP(nn.Module):
     """Feed-forward network mapping ligand features to ``K`` logits."""
 
@@ -79,6 +139,7 @@ class MultilabelMLP:
         es_val_fraction: float = float(ml_config.MLP_DEFAULTS["es_val_fraction"]),
         es_min_delta: float = float(ml_config.MLP_DEFAULTS["es_min_delta"]),
         class_weights: bool = bool(ml_config.MLP_DEFAULTS["class_weights"]),
+        active_fraction: Optional[float] = ml_config.MLP_DEFAULTS["active_fraction"],
         seed: int = ml_config.RANDOM_SEED,
         device: Optional[torch.device] = None,
     ) -> None:
@@ -99,8 +160,14 @@ class MultilabelMLP:
                 early-stopping holdout.
             es_min_delta: Minimum micro-AUPRC increase counted as improvement.
             class_weights: If ``True``, use per-label ``pos_weight = n_neg/n_pos``.
+            active_fraction: If set, keep a fixed per-label train mask so
+                positives are approximately this fraction of supervised cells.
+                ``None`` disables masking.
             seed: Random seed.
             device: Torch device; auto-selected when ``None``.
+
+        Raises:
+            ValueError: If ``active_fraction`` is outside ``(0, 1]``.
         """
         self.n_labels = int(n_labels)
         self.hidden_dim = int(hidden_dim)
@@ -114,6 +181,15 @@ class MultilabelMLP:
         self.es_val_fraction = float(es_val_fraction)
         self.es_min_delta = float(es_min_delta)
         self.class_weights = bool(class_weights)
+        if active_fraction is None:
+            self.active_fraction: Optional[float] = None
+        else:
+            fraction = float(active_fraction)
+            if not (0.0 < fraction <= 1.0):
+                raise ValueError(
+                    f"active_fraction must be in (0, 1], got {active_fraction!r}."
+                )
+            self.active_fraction = fraction
         self.seed = int(seed)
         self.device = device if device is not None else select_device()
         self.input_dim: Optional[int] = None
@@ -208,6 +284,10 @@ class MultilabelMLP:
     ) -> "MultilabelMLP":
         """Train the multilabel MLP with optional scaffold-cold early stopping.
 
+        When ``active_fraction`` is set, a fixed per-label negative mask is
+        built on the fit rows after the early-stopping carve. Train BCE uses
+        only masked cells; early-stop micro-AUPRC still uses the full labels.
+
         Args:
             X: Feature matrix ``(n, d)``.
             y: Multilabel matrix ``(n, K)`` with values in ``{0, 1}``.
@@ -289,15 +369,54 @@ class MultilabelMLP:
         )
 
         y_fit = y_np[train_rows]
-        n_pos = y_fit.sum(axis=0)
-        n_neg = float(y_fit.shape[0]) - n_pos
+        train_mask: Optional[np.ndarray] = None
+        mask_t: Optional[torch.Tensor] = None
+        if self.active_fraction is not None:
+            mask_rng = np.random.default_rng(self.seed)
+            train_mask = build_active_fraction_mask(
+                y_fit, self.active_fraction, mask_rng
+            )
+            full_mask = np.zeros((n, self.n_labels), dtype=np.float32)
+            full_mask[train_rows] = train_mask.astype(np.float32)
+            mask_t = torch.from_numpy(full_mask).to(self.device)
+            if verbose:
+                positives = y_fit > 0.5
+                n_pos_col = positives.sum(axis=0).astype(np.float64)
+                n_kept_neg = ((~positives) & train_mask).sum(axis=0).astype(
+                    np.float64
+                )
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    dens = np.where(
+                        n_pos_col > 0,
+                        n_pos_col / np.maximum(n_pos_col + n_kept_neg, 1.0),
+                        np.nan,
+                    )
+                finite_dens = dens[np.isfinite(dens)]
+                dens_msg = (
+                    f"median={float(np.median(finite_dens)):.3f}"
+                    if finite_dens.size
+                    else "n/a"
+                )
+                print(
+                    f"[multilabel-mlp] active_fraction={self.active_fraction:.3f} "
+                    f"fixed per-label mask; kept-neg median="
+                    f"{float(np.median(n_kept_neg)):.0f} "
+                    f"effective_pos_frac {dens_msg}",
+                    flush=True,
+                )
+
+        if train_mask is not None:
+            n_pos = (y_fit * train_mask.astype(np.float32)).sum(axis=0)
+            n_neg = ((1.0 - y_fit) * train_mask.astype(np.float32)).sum(axis=0)
+        else:
+            n_pos = y_fit.sum(axis=0)
+            n_neg = float(y_fit.shape[0]) - n_pos
+        pos_weight_t: Optional[torch.Tensor] = None
         if self.class_weights:
             with np.errstate(divide="ignore", invalid="ignore"):
                 weights = np.where(n_pos > 0, n_neg / np.maximum(n_pos, 1.0), 1.0)
             self.pos_weight = weights.astype(np.float32)
-            loss_fn = nn.BCEWithLogitsLoss(
-                pos_weight=torch.from_numpy(self.pos_weight).to(self.device)
-            )
+            pos_weight_t = torch.from_numpy(self.pos_weight).to(self.device)
             if verbose:
                 finite = self.pos_weight[np.isfinite(self.pos_weight)]
                 print(
@@ -308,7 +427,19 @@ class MultilabelMLP:
                 )
         else:
             self.pos_weight = None
-            loss_fn = nn.BCEWithLogitsLoss()
+
+        if mask_t is None:
+            loss_fn = (
+                nn.BCEWithLogitsLoss(pos_weight=pos_weight_t)
+                if pos_weight_t is not None
+                else nn.BCEWithLogitsLoss()
+            )
+        else:
+            loss_fn = (
+                nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight_t)
+                if pos_weight_t is not None
+                else nn.BCEWithLogitsLoss(reduction="none")
+            )
 
         best_score = -math.inf
         best_state: Optional[dict[str, torch.Tensor]] = None
@@ -326,10 +457,18 @@ class MultilabelMLP:
                 yb = y_t[rows].to(self.device)
                 optimizer.zero_grad()
                 pred = self.net(xb)
-                loss = loss_fn(pred, yb)
+                if mask_t is None:
+                    loss = loss_fn(pred, yb)
+                    batch_loss = float(loss.item())
+                else:
+                    per_cell = loss_fn(pred, yb)
+                    mb = mask_t[rows]
+                    kept = mb.sum().clamp_min(1.0)
+                    loss = (per_cell * mb).sum() / kept
+                    batch_loss = float(loss.item())
                 loss.backward()
                 optimizer.step()
-                running += float(loss.item()) * len(rows)
+                running += batch_loss * len(rows)
                 seen += len(rows)
                 if verbose and (bstart // self.batch_size) % 200 == 0:
                     print(
@@ -411,6 +550,7 @@ class MultilabelMLP:
             "es_val_fraction": self.es_val_fraction,
             "es_min_delta": self.es_min_delta,
             "class_weights": self.class_weights,
+            "active_fraction": self.active_fraction,
             "seed": self.seed,
             "input_dim": self.input_dim,
             "feature_mean": self.feature_mean,
@@ -478,6 +618,7 @@ class MultilabelMLP:
             es_val_fraction=float(state["es_val_fraction"]),
             es_min_delta=float(state["es_min_delta"]),
             class_weights=bool(state["class_weights"]),
+            active_fraction=state.get("active_fraction"),
             seed=int(state["seed"]),
         )
         model.input_dim = int(state["input_dim"])
