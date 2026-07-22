@@ -119,16 +119,38 @@ def build_family_vocab(
     return sorted(labels)
 
 
+def filter_vocab_by_min_positives(
+    labels: Sequence[str],
+    active_counts: Counter[str],
+    min_positives: int = ml_config.MIN_POSITIVES,
+) -> list[str]:
+    """Keep vocabulary labels with enough unique active ligands.
+
+    Args:
+        labels: Candidate vocabulary labels (order preserved among survivors).
+        active_counts: Mapping ``label -> unique active ligand count``.
+        min_positives: Minimum unique active ligands required for inclusion.
+
+    Returns:
+        Filtered label list in the same relative order as ``labels``.
+    """
+    return [
+        label
+        for label in labels
+        if int(active_counts.get(label, 0)) >= int(min_positives)
+    ]
+
+
 def build_target_vocab(
     target_active_counts: Counter[str],
-    min_actives: int = ml_config.TARGET_MIN_ACTIVES,
+    min_positives: int = ml_config.MIN_POSITIVES,
     max_size: int = ml_config.TARGET_VOCAB_SIZE,
 ) -> list[str]:
     """Select the top targets by active-ligand count.
 
     Args:
         target_active_counts: Mapping ``target_id -> unique active ligand count``.
-        min_actives: Minimum unique active ligands required for inclusion.
+        min_positives: Minimum unique active ligands required for inclusion.
         max_size: Maximum vocabulary size after filtering.
 
     Returns:
@@ -137,7 +159,7 @@ def build_target_vocab(
     eligible = [
         (target_id, count)
         for target_id, count in target_active_counts.items()
-        if count >= min_actives
+        if count >= min_positives
     ]
     eligible.sort(key=lambda item: (-item[1], item[0]))
     return [target_id for target_id, _ in eligible[:max_size]]

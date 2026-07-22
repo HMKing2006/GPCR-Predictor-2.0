@@ -38,41 +38,8 @@ import pyarrow.parquet as pq
 
 import config
 from src.data_prep import canonicalize_smiles
-
-# Output columns in the BindingDB prepared schema (Parquet / CSV-compatible).
-_OUTPUT_COLUMNS: list[str] = [
-    "Ligand SMILES",
-    "Target Name",
-    "Target Source Organism According to Curator or DataSource",
-    "Ki (nM)",
-    "IC50 (nM)",
-    "Kd (nM)",
-    "EC50 (nM)",
-    "Other (nM)",
-    "Activity Label",
-    "pH",
-    "Temp (C)",
-    "BindingDB Target Chain Sequence 1",
-    "Year",
-]
-
-_PARQUET_SCHEMA = pa.schema(
-    [
-        ("Ligand SMILES", pa.string()),
-        ("Target Name", pa.string()),
-        ("Target Source Organism According to Curator or DataSource", pa.string()),
-        ("Ki (nM)", pa.string()),
-        ("IC50 (nM)", pa.string()),
-        ("Kd (nM)", pa.string()),
-        ("EC50 (nM)", pa.string()),
-        ("Other (nM)", pa.string()),
-        ("Activity Label", pa.string()),
-        ("pH", pa.string()),
-        ("Temp (C)", pa.string()),
-        ("BindingDB Target Chain Sequence 1", pa.string()),
-        ("Year", pa.int32()),
-    ]
-)
+from src.prepared_schema import OUTPUT_COLUMNS as _OUTPUT_COLUMNS
+from src.prepared_schema import PARQUET_SCHEMA as _PARQUET_SCHEMA
 
 # Papyrus type_* column -> BindingDB assay column. Order is the preference used
 # when more than one type flag is set on a row (rare).

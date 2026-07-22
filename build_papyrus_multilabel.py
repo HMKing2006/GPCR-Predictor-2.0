@@ -22,12 +22,14 @@ from src.multilabel import config as ml_config
 from src.multilabel.labels import (
     aggregate_ligand_labels,
     build_label_matrix,
+    count_family_actives,
     count_target_actives,
     years_array,
 )
 from src.multilabel.vocab import (
     build_family_vocab,
     build_target_vocab,
+    filter_vocab_by_min_positives,
     save_vocab,
 )
 
@@ -158,7 +160,7 @@ def build_multilabel_tables(
     papyrus_root: Optional[str] = None,
     threshold_nm: float = ml_config.ACTIVITY_THRESHOLD_NM,
     classification_depth: int = ml_config.CLASSIFICATION_DEPTH,
-    target_min_actives: int = ml_config.TARGET_MIN_ACTIVES,
+    min_positives: int = ml_config.MIN_POSITIVES,
     target_vocab_size: int = ml_config.TARGET_VOCAB_SIZE,
     limit: Optional[int] = None,
     verbose: bool = True,
@@ -171,7 +173,7 @@ def build_multilabel_tables(
         papyrus_root: Optional Papyrus data directory.
         threshold_nm: Quantitative binder cutoff.
         classification_depth: Family Classification path depth.
-        target_min_actives: Minimum unique active ligands per target.
+        min_positives: Minimum unique active ligands per family/target label.
         target_vocab_size: Cap on target vocabulary size.
         limit: Optional activity-row stream limit.
         verbose: If ``True``, print progress.
@@ -199,27 +201,31 @@ def build_multilabel_tables(
         )
 
     smiles_order = sorted(by_ligand)
+    family_counts = count_family_actives(by_ligand)
     family_vocab = build_family_vocab(
         (meta["Classification"] for meta in by_sequence.values()),
         depth=classification_depth,
     )
-    # Restrict to families that appear on at least one aggregated active ligand.
-    used_families = set()
-    for state in by_ligand.values():
-        used_families.update(state.families)
-    family_vocab = [label for label in family_vocab if label in used_families]
+    # Restrict to families with enough unique active ligands.
+    family_vocab = filter_vocab_by_min_positives(
+        family_vocab,
+        family_counts,
+        min_positives=min_positives,
+    )
     if not family_vocab:
-        raise RuntimeError("Family vocabulary is empty after aggregation.")
+        raise RuntimeError(
+            "Family vocabulary is empty; lower --min-positives or check data."
+        )
 
     target_counts = count_target_actives(by_ligand)
     target_vocab = build_target_vocab(
         target_counts,
-        min_actives=target_min_actives,
+        min_positives=min_positives,
         max_size=target_vocab_size,
     )
     if not target_vocab:
         raise RuntimeError(
-            "Target vocabulary is empty; lower --target-min-actives or check data."
+            "Target vocabulary is empty; lower --min-positives or check data."
         )
 
     save_vocab(
@@ -228,8 +234,12 @@ def build_multilabel_tables(
         meta={
             "task": "family",
             "classification_depth": classification_depth,
+            "min_positives": int(min_positives),
             "activity_threshold_nm": float(threshold_nm),
             "activity_source": os.path.realpath(activity_source),
+            "active_counts": {
+                label: int(family_counts[label]) for label in family_vocab
+            },
         },
     )
     save_vocab(
@@ -237,7 +247,7 @@ def build_multilabel_tables(
         target_vocab,
         meta={
             "task": "target",
-            "min_actives": int(target_min_actives),
+            "min_positives": int(min_positives),
             "max_size": int(target_vocab_size),
             "activity_threshold_nm": float(threshold_nm),
             "activity_source": os.path.realpath(activity_source),
@@ -359,10 +369,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="1-based Classification path depth for family labels (default 2).",
     )
     parser.add_argument(
-        "--target-min-actives",
+        "--min-positives",
         type=int,
-        default=ml_config.TARGET_MIN_ACTIVES,
-        help="Minimum unique active ligands required for a target_id.",
+        default=ml_config.MIN_POSITIVES,
+        help=(
+            "Minimum unique active ligands required for a family or target "
+            "label to be included in the vocabulary (default 100)."
+        ),
     )
     parser.add_argument(
         "--target-vocab-size",
@@ -400,7 +413,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         papyrus_root=args.papyrus_root,
         threshold_nm=args.threshold_nm,
         classification_depth=args.classification_depth,
-        target_min_actives=args.target_min_actives,
+        min_positives=args.min_positives,
         target_vocab_size=args.target_vocab_size,
         limit=args.limit,
         verbose=not args.quiet,

@@ -17,15 +17,30 @@ FAMILY_PREPARED: Final[str] = os.path.join(TRAIN_DIR, "Ligand_family_prepared.pa
 TARGET_PREPARED: Final[str] = os.path.join(TRAIN_DIR, "Ligand_target_prepared.parquet")
 FAMILY_VOCAB_PATH: Final[str] = os.path.join(TRAIN_DIR, "family_vocab.json")
 TARGET_VOCAB_PATH: Final[str] = os.path.join(TRAIN_DIR, "target_vocab.json")
+
+# GPCRdb multilabel artifacts (separate from Papyrus so both can coexist).
+GPCRDB_PROTEINS_SIDECAR: Final[str] = os.path.join(
+    TRAIN_DIR, "GPCRdb_proteins_multilabel.parquet"
+)
+GPCRDB_FAMILY_PREPARED: Final[str] = os.path.join(
+    TRAIN_DIR, "GPCRdb_Ligand_family_prepared.parquet"
+)
+GPCRDB_TARGET_PREPARED: Final[str] = os.path.join(
+    TRAIN_DIR, "GPCRdb_Ligand_target_prepared.parquet"
+)
+GPCRDB_FAMILY_VOCAB_PATH: Final[str] = os.path.join(TRAIN_DIR, "GPCRdb_family_vocab.json")
+GPCRDB_TARGET_VOCAB_PATH: Final[str] = os.path.join(TRAIN_DIR, "GPCRdb_target_vocab.json")
+
 MODELS_DIR: Final[str] = os.path.join(root_config.MODELS_DIR, "multilabel")
 
 # Default activity source for aggregation (pair prepared Parquet, unchanged).
 DEFAULT_ACTIVITY_SOURCE: Final[str] = root_config.PAPYRUS_FULL_BINARY_TRAIN_CSV
+DEFAULT_GPCRDB_ACTIVITY_SOURCE: Final[str] = root_config.GPCRDB_TRAIN_CSV
 
 # --- Vocabulary defaults -----------------------------------------------------
 
 CLASSIFICATION_DEPTH: Final[int] = 2  # 1-based path depth (level-2 token)
-TARGET_MIN_ACTIVES: Final[int] = 10
+MIN_POSITIVES: Final[int] = 100  # unique active ligands required per label
 TARGET_VOCAB_SIZE: Final[int] = 1024
 
 # --- Split / training defaults -----------------------------------------------

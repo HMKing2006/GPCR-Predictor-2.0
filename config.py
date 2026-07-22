@@ -21,6 +21,8 @@ PAPYRUS_FULL_TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "Papyrus_fu
 PAPYRUS_FULL_BINARY_TRAIN_CSV: Final[str] = os.path.join(
     DATA_DIR, "train", "Papyrus_full_binary_prepared.parquet"
 )
+GPCRDB_TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "GPCRdb_prepared.parquet")
+GPCRDB_RAW_CSV: Final[str] = os.path.join(DATA_DIR, "train", "gpcrdb_data.csv")
 CACHE_DIR: Final[str] = os.path.join(PROJECT_ROOT, "cache")
 # Legacy flat cache paths retained for callers of low-level split helpers.
 SPLITS_DIR: Final[str] = os.path.join(DATA_DIR, "splits")

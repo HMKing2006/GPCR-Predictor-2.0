@@ -134,6 +134,22 @@ def aggregate_ligand_labels(
     return by_ligand
 
 
+def count_family_actives(by_ligand: Mapping[str, LigandAccumulator]) -> Counter[str]:
+    """Count unique active ligands per family label.
+
+    Args:
+        by_ligand: Aggregated ligand label state.
+
+    Returns:
+        ``Counter`` of family labels to unique-ligand counts.
+    """
+    counts: Counter[str] = Counter()
+    for state in by_ligand.values():
+        for family in state.families:
+            counts[family] += 1
+    return counts
+
+
 def count_target_actives(by_ligand: Mapping[str, LigandAccumulator]) -> Counter[str]:
     """Count unique active ligands per ``target_id``.
 

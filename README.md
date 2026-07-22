@@ -131,6 +131,44 @@ Dataset caches are grouped under
 resolved source path, file size, modification time, cutoff, limit, and assay
 context before reuse.
 
+### GPCRdb
+
+Build a BindingDB-compatible prepared **Parquet** from a GPCRdb / ChEMBL
+activity CSV (`data/train/gpcrdb_data.csv`) with `build_gpcrdb.py`. The script
+resolves ligand SMILES via the ChEMBL REST API and protein sequences via
+UniProt (cached under `cache/gpcrdb/`), maps Ki/IC50/EC50/Kd and Other-style
+types (Potency, AC50, …), and writes:
+
+```bash
+python build_gpcrdb.py
+# output: data/train/GPCRdb_prepared.parquet
+
+python build_gpcrdb.py --limit 10000   # smoke test
+```
+
+`Year` is empty in this build (the source CSV has no publication year). Prefer
+`--test-split protein` or `double-cold` (not `time`) for GPCRdb-only training.
+
+```bash
+python train.py --data data/train/GPCRdb_prepared.parquet --rebuild-features
+python grid_search.py --data data/train/GPCRdb_prepared.parquet --rebuild-features
+```
+
+**Joint training with Papyrus:** both builders share the same prepared schema,
+so concatenate Parquets into one file and pass that path to `--data`. Prefer
+protein / double-cold splits until GPCRdb years exist. Overlap between ChEMBL
+and Papyrus is not deduplicated automatically.
+
+```bash
+python -c "import pyarrow.parquet as pq; pq.write_table(
+  pq.concat_tables([
+    pq.read_table('data/train/Papyrus_full_prepared.parquet'),
+    pq.read_table('data/train/GPCRdb_prepared.parquet'),
+  ]),
+  'data/train/Papyrus_GPCRdb_prepared.parquet')"
+python train.py --data data/train/Papyrus_GPCRdb_prepared.parquet --rebuild-features
+```
+
 ## Ligand representations
 
 `--ligand-model` accepts a Hugging Face SMILES transformer id, a reserved RDKit
@@ -371,8 +409,8 @@ to remove the stack.
 
 Defaults:
 
-- **Family vocab:** ChEMBL protein `Classification` level-2 tokens
-- **Target vocab:** `target_id`s with ≥10 active ligands, top 1024 by count
+- **Family / target vocab:** labels need ≥``--min-positives`` unique active
+  ligands (default **100**); targets are further capped at top 1024 by count
 - **Positives:** same binder rule as pair training; negatives are implicit zeros
 - **Splits:** nested ``--test-split`` / ``--validation-split`` with
   ``scaffold`` (Murcko-cold, default) or ``time`` (percentage year cutoffs);
@@ -404,11 +442,36 @@ python predict_multilabel.py --model models/multilabel/family_multilabel__test-s
   --ligand "CCO" --top-k 10 --output family_preds.csv
 ```
 
+### GPCRdb multilabel
+
+Requires `data/train/GPCRdb_prepared.parquet` first (`build_gpcrdb.py`).
+Target labels use GPCRdb **Entry name** (not Papyrus `P47747_WT`-style IDs).
+Family labels reuse Papyrus `Classification` joined by sequence when available;
+family artifacts are skipped if that coverage is too thin. Outputs are
+GPCRdb-prefixed so Papyrus multilabel files are not overwritten. Prefer
+scaffold splits (`Year` is empty on GPCRdb).
+
+```bash
+python build_gpcrdb_multilabel.py
+python build_gpcrdb_multilabel.py --limit 10000   # smoke
+
+python train_multilabel.py --task target \
+  --data data/train/GPCRdb_Ligand_target_prepared.parquet \
+  --vocab data/train/GPCRdb_target_vocab.json --rebuild-features
+
+python train_multilabel.py --task family \
+  --data data/train/GPCRdb_Ligand_family_prepared.parquet \
+  --vocab data/train/GPCRdb_family_vocab.json --rebuild-features
+```
+
 ## Project layout
 
 ```
 config.py            Central configuration and defaults.
 build_papyrus.py     Download Papyrus and write prepared Parquet (+ Year).
+build_gpcrdb.py      Resolve GPCRdb/ChEMBL CSV → prepared Parquet (SMILES + sequences).
+build_gpcrdb_multilabel.py  GPCRdb ligand family/target multilabel tables + vocab.
+src/prepared_schema.py  Shared BindingDB prepared columns / Parquet schema.
 src/data_prep.py     Streaming cleaning + label preparation (CSV / Parquet).
 src/lmdb_cache.py    Embedding cache with model-derived DB names.
 src/embeddings.py    ESM-2 and MoLFormer-XL embedders.
@@ -425,6 +488,7 @@ predict.py           Four prediction modes.
 # Experimental ligand multilabel (deletable)
 src/multilabel/              Isolated family/target multilabel package.
 build_papyrus_multilabel.py  Build ligand prepared tables + vocab.
+build_gpcrdb_multilabel.py   GPCRdb Entry-name target multilabel tables + vocab.
 train_multilabel.py          Train family or target multilabel MLP.
 grid_search_multilabel.py    Grid-search multilabel MLPs (val micro-AUPRC).
 predict_multilabel.py        Ligand → multilabel probability vector.
