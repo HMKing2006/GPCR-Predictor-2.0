@@ -23,7 +23,6 @@ from src.screen_library import (
     DEFAULT_LIGAND_MAP,
     DEFAULT_MODEL,
     ScreenLibrary,
-    format_top_hits_markdown,
 )
 from src.uniprot_search import UniProtHit, fetch_sequence, search_swissprot
 
@@ -82,21 +81,20 @@ def on_search(query: str) -> Any:
 
 def on_select_suggestion(
     label: Optional[str],
-) -> tuple[str, str, str, Optional[str]]:
+) -> tuple[str, str, str]:
     """Resolve a clicked suggestion to a UniProt sequence.
 
     Args:
         label: Selected Radio label.
 
     Returns:
-        Tuple of ``(status_markdown, accession, sequence, protein_summary)``.
+        Tuple of ``(status_markdown, accession, sequence)``.
     """
     if not label or label not in _LABEL_TO_HIT:
         return (
             "_No protein selected._",
             "",
             "",
-            None,
         )
     hit = _LABEL_TO_HIT[label]
     try:
@@ -106,7 +104,6 @@ def on_select_suggestion(
             f"**Failed to fetch sequence for {hit.accession}:** {exc}",
             "",
             "",
-            None,
         )
     name = entry.gene or entry.protein_name or entry.accession
     status = (
@@ -115,11 +112,27 @@ def on_select_suggestion(
         f"**Organism:** {entry.organism or 'n/a'}  \n"
         f"**Sequence length:** {len(entry.sequence)} aa"
     )
-    summary = (
-        f"{entry.gene or entry.protein_name} ({entry.accession}), "
-        f"{len(entry.sequence)} aa"
-    )
-    return status, entry.accession, entry.sequence, summary
+    return status, entry.accession, entry.sequence
+
+
+def _format_bytes(n_bytes: int) -> str:
+    """Format a byte count for a download button label.
+
+    Args:
+        n_bytes: Size in bytes.
+
+    Returns:
+        A short human-readable size such as ``14.6 MB``.
+    """
+    mb = n_bytes / (1024 * 1024)
+    if mb >= 10:
+        return f"{mb:.0f} MB"
+    if mb >= 1:
+        return f"{mb:.1f} MB"
+    kb = n_bytes / 1024
+    if kb >= 1:
+        return f"{kb:.0f} KB"
+    return f"{n_bytes} B"
 
 
 def on_run_screen(
@@ -127,7 +140,7 @@ def on_run_screen(
     accession: str,
     model_path: str,
     ligand_map_path: str,
-) -> tuple[list[tuple[Any, str]], str, Optional[str], str]:
+) -> tuple[list[tuple[Any, str]], Any, str]:
     """Screen the selected protein against Sytravon + Genesis.
 
     Args:
@@ -137,30 +150,35 @@ def on_run_screen(
         ligand_map_path: Ligand ID map path.
 
     Returns:
-        Tuple of ``(gallery_items, markdown_table, csv_path, status)``.
+        Tuple of ``(gallery_items, download_button_update, status)``.
     """
     seq = str(sequence or "").strip()
     if not seq:
-        return [], "_Select a Swiss-Prot protein first._", None, "No protein selected."
+        return (
+            [],
+            gr.update(value=None, label="Download Full Results", interactive=False),
+            "No protein selected.",
+        )
 
     try:
         screen = _get_screen(model_path, ligand_map_path)
         results = screen.screen(seq)
         hits = screen.top_hits(results, k=10)
     except Exception as exc:  # noqa: BLE001
-        return [], f"**Screening failed:** {exc}", None, f"Error: {exc}"
+        return (
+            [],
+            gr.update(value=None, label="Download Full Results", interactive=False),
+            f"Error: {exc}",
+        )
 
     gallery: list[tuple[Any, str]] = []
     for hit in hits:
-        caption = (
-            f"#{hit.rank} {hit.ligand_id} | {hit.dataset} | "
-            f"P(Active)={hit.p_active:.4f}\n{hit.smiles}"
-        )
+        caption = hit.smiles
         if hit.image is not None:
             gallery.append((hit.image, caption))
         else:
             blank = Image.new("RGB", (320, 240), color=(255, 255, 255))
-            gallery.append((blank, caption + "\n(no depiction)"))
+            gallery.append((blank, caption))
 
     csv_bytes = ScreenLibrary.results_to_csv_bytes(results)
     acc = str(accession or "protein").strip().upper() or "protein"
@@ -169,21 +187,64 @@ def on_run_screen(
     with open(csv_path, "wb") as handle:
         handle.write(csv_bytes)
 
-    status = (
-        f"Scored {len(results):,} ligands. "
-        f"Top hit P(Active)={hits[0].p_active:.4f}."
-        if hits
-        else f"Scored {len(results):,} ligands; no hits."
+    size_label = _format_bytes(len(csv_bytes))
+    download_update = gr.update(
+        value=csv_path,
+        label=f"Download Full Results ({size_label})",
+        interactive=True,
     )
-    return gallery, format_top_hits_markdown(hits), csv_path, status
+    status = f"Scored {len(results):,} ligands."
+    return gallery, download_update, status
+
+
+_GALLERY_CAPTION_CSS = """
+html, body, .gradio-container,
+.gradio-container button, .gradio-container input,
+.gradio-container textarea, .gradio-container label,
+.gradio-container .prose, .gradio-container markdown {
+    font-family: "Sinhala Sangam MN", Georgia, serif !important;
+}
+.caption {
+    white-space: normal !important;
+    overflow-wrap: anywhere !important;
+    word-break: break-all !important;
+    text-overflow: clip !important;
+    overflow-y: auto !important;
+    max-height: 28vh;
+    max-width: 100% !important;
+    align-self: stretch !important;
+}
+/* Hide the preview strip of all gallery thumbnails (covers SMILES). */
+.preview .thumbnails {
+    display: none !important;
+}
+/* Grid tile captions: span bottom edge; ellipsis inside the tile. */
+.caption-label {
+    left: var(--block-label-margin) !important;
+    right: var(--block-label-margin) !important;
+    max-width: none !important;
+    width: auto !important;
+    text-align: left !important;
+    overflow: hidden !important;
+    white-space: nowrap !important;
+    text-overflow: ellipsis !important;
+}
+/* Full-width prominent CSV download button. */
+#download-full-results button {
+    width: 100% !important;
+    min-height: 3.25rem !important;
+    font-size: 1.15rem !important;
+    font-weight: 600 !important;
+}
+"""
 
 
 def build_app(model_path: str, ligand_map_path: str) -> gr.Blocks:
     """Construct the Gradio Blocks UI.
 
     Args:
-        model_path: Default joblib model path (overridable in Advanced).
-        ligand_map_path: Default ligand map path.
+        model_path: Joblib model path (from CLI ``--model``).
+        ligand_map_path: Ligand map path (from CLI ``--ligand-map``).
 
     Returns:
         A Gradio ``Blocks`` app.
@@ -211,19 +272,10 @@ structures; download the full CSV of `SMILES`, `ID`, `dataset`, and `P(Active)`.
             search_btn = gr.Button("Search", scale=1)
         suggestions = gr.Radio(
             choices=[],
-            label="Suggestions (search, then click to select)",
+            label="Suggestions (click to select)",
             interactive=True,
         )
         selected = gr.Markdown("_No protein selected._")
-        selected_summary = gr.Textbox(
-            label="Selected protein",
-            interactive=False,
-            value="",
-        )
-
-        with gr.Accordion("Advanced", open=False):
-            model_box = gr.Textbox(label="Model path", value=model_path)
-            map_box = gr.Textbox(label="Ligand map path", value=ligand_map_path)
 
         run_btn = gr.Button("Run library screen", variant="primary")
         status = gr.Markdown("")
@@ -234,20 +286,38 @@ structures; download the full CSV of `SMILES`, `ID`, `dataset`, and `P(Active)`.
             height="auto",
             object_fit="contain",
         )
-        table = gr.Markdown("")
-        csv_file = gr.File(label="Download full results (CSV)")
+        download_btn = gr.DownloadButton(
+            label="Download Full Results",
+            value=None,
+            variant="primary",
+            size="lg",
+            interactive=False,
+            elem_id="download-full-results",
+        )
+
+        def _run(sequence: str, accession: str) -> tuple[list[tuple[Any, str]], Any, str]:
+            """Run screening with the app's fixed model and ligand map paths.
+
+            Args:
+                sequence: Amino-acid sequence.
+                accession: UniProt accession (for CSV naming).
+
+            Returns:
+                Tuple of ``(gallery_items, download_button_update, status)``.
+            """
+            return on_run_screen(sequence, accession, model_path, ligand_map_path)
 
         search_btn.click(fn=on_search, inputs=[query], outputs=[suggestions])
         query.submit(fn=on_search, inputs=[query], outputs=[suggestions])
         suggestions.change(
             fn=on_select_suggestion,
             inputs=[suggestions],
-            outputs=[selected, accession_state, sequence_state, selected_summary],
+            outputs=[selected, accession_state, sequence_state],
         )
         run_btn.click(
-            fn=on_run_screen,
-            inputs=[sequence_state, accession_state, model_box, map_box],
-            outputs=[gallery, table, csv_file, status],
+            fn=_run,
+            inputs=[sequence_state, accession_state],
+            outputs=[gallery, download_btn, status],
         )
 
     return demo
@@ -305,6 +375,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         share=bool(args.share),
         server_name=args.server_name,
         server_port=int(args.server_port),
+        css=_GALLERY_CAPTION_CSS,
     )
 
 

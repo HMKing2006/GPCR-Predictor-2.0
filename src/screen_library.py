@@ -2,6 +2,11 @@
 
 Loads the ligand ID map, scores one protein against the full library with
 :class:`predict.Predictor`, and builds top-k RDKit depictions plus a CSV export.
+
+Ligand features are materialized once into a contiguous RAM matrix during
+:meth:`ScreenLibrary.warm_ligands` so each :meth:`ScreenLibrary.screen` call
+only embeds the protein and runs the classifier (no repeated LMDB membership
+scans or ligand reloads).
 """
 
 from __future__ import annotations
@@ -19,6 +24,8 @@ from rdkit.Chem import Draw
 
 import config
 from predict import Predictor
+from src.data_prep import canonicalize_smiles
+from src.featurize import assemble_matrix
 
 DEFAULT_LIGAND_MAP: str = os.path.join(
     config.DATA_DIR, "screen", "ligand_id_map.tsv"
@@ -29,6 +36,8 @@ DEFAULT_MODEL: str = os.path.join(
 DEFAULT_ASSAY: str = "Ki"
 DEFAULT_PH: float = float(config.DEFAULT_PH)
 DEFAULT_TEMP: float = float(config.DEFAULT_TEMP_C)
+_ASSAY_INDEX = {name: i for i, name in enumerate(config.ASSAY_TYPES)}
+_SCORE_CHUNK = 20_000
 
 
 @dataclass(frozen=True)
@@ -83,6 +92,8 @@ class ScreenLibrary:
             raise FileNotFoundError(f"Model not found: {model_path}")
         if not os.path.isfile(ligand_map_path):
             raise FileNotFoundError(f"Ligand map not found: {ligand_map_path}")
+        if assay not in _ASSAY_INDEX:
+            raise ValueError(f"Unknown assay {assay!r}; expected one of {config.ASSAY_TYPES}")
 
         self.assay = assay
         self.ph = float(ph)
@@ -90,6 +101,7 @@ class ScreenLibrary:
         self.verbose = verbose
         self.predictor = Predictor(model_path, verbose=verbose)
         self.ligands = self._load_ligand_map(ligand_map_path)
+        self._ligand_matrix: Optional[np.ndarray] = None
         self._warmed = False
 
     @staticmethod
@@ -124,20 +136,59 @@ class ScreenLibrary:
         return out
 
     def warm_ligands(self) -> None:
-        """Ensure all library ligand features are present in the LMDB caches.
+        """Canonicalize, cache-fill, and load all library ligand features into RAM.
+
+        Subsequent :meth:`screen` calls reuse the in-memory matrix and skip LMDB
+        membership checks for ligands.
 
         Returns:
             None.
+
+        Raises:
+            ValueError: If no SMILES in the library can be canonicalized.
         """
-        if self._warmed:
+        if self._warmed and self._ligand_matrix is not None:
             return
-        smiles = self.ligands["SMILES"].tolist()
+
+        raw_smiles = self.ligands["SMILES"].tolist()
         if self.verbose:
-            print(f"[screen] warming {len(smiles):,} ligand features…", flush=True)
-        self.predictor._ligand_vectors(smiles)
+            print(f"[screen] warming {len(raw_smiles):,} ligand features…", flush=True)
+
+        canon: list[str] = []
+        keep: list[int] = []
+        for i, smiles in enumerate(raw_smiles):
+            c = canonicalize_smiles(smiles)
+            if c is not None:
+                keep.append(i)
+                canon.append(c)
+        if not canon:
+            raise ValueError("No valid SMILES in the ligand library.")
+        if len(keep) != len(self.ligands):
+            dropped = len(self.ligands) - len(keep)
+            if self.verbose:
+                print(f"[screen] dropped {dropped:,} unparseable SMILES", flush=True)
+            self.ligands = self.ligands.iloc[keep].reset_index(drop=True)
+
+        featurizer = self.predictor.ligand_featurizer
+        featurizer.ensure_cached(canon, verbose=self.verbose)
+        if self.verbose:
+            print(
+                f"[screen] loading {len(canon):,} ligand vectors into RAM "
+                f"({featurizer.dim}-d)…",
+                flush=True,
+            )
+        self._ligand_matrix = np.ascontiguousarray(
+            featurizer.vectors_for(canon), dtype=np.float32
+        )
         self._warmed = True
         if self.verbose:
-            print("[screen] ligand features ready", flush=True)
+            nbytes = self._ligand_matrix.nbytes
+            print(
+                f"[screen] ligand matrix ready "
+                f"({self._ligand_matrix.shape[0]:,} x {self._ligand_matrix.shape[1]}, "
+                f"{nbytes / (1024**2):.0f} MiB)",
+                flush=True,
+            )
 
     def close(self) -> None:
         """Close the underlying predictor caches.
@@ -159,23 +210,44 @@ class ScreenLibrary:
 
         Raises:
             ValueError: If ``sequence`` is empty.
+            RuntimeError: If the ligand matrix failed to warm.
         """
         seq = str(sequence or "").strip()
         if not seq:
             raise ValueError("Protein sequence is required.")
         self.warm_ligands()
+        if self._ligand_matrix is None:
+            raise RuntimeError("Ligand matrix was not warmed.")
+
         n = len(self.ligands)
-        smiles = self.ligands["SMILES"].tolist()
-        sequences = [seq] * n
-        assays = [self.assay] * n
-        phs = [self.ph] * n
-        temps = [self.temp] * n
         if self.verbose:
             print(f"[screen] scoring {n:,} ligands…", flush=True)
-        preds = self.predictor.predict_aligned(smiles, sequences, assays, phs, temps)
+
+        pvecs = self.predictor._protein_vectors([seq])
+        protein_vec = pvecs[seq]
+        assay_idx_val = _ASSAY_INDEX[self.assay]
+        preds = np.empty(n, dtype=np.float64)
+
+        for start in range(0, n, _SCORE_CHUNK):
+            end = min(start + _SCORE_CHUNK, n)
+            m = end - start
+            protein_block = np.broadcast_to(protein_vec, (m, protein_vec.shape[0])).copy()
+            ligand_block = self._ligand_matrix[start:end]
+            assay_idx = np.full(m, assay_idx_val, dtype=np.int64)
+            ph_arr = np.full(m, self.ph, dtype=np.float32)
+            temp_arr = np.full(m, self.temp, dtype=np.float32)
+            matrix = assemble_matrix(
+                protein_block,
+                ligand_block,
+                assay_idx,
+                ph_arr,
+                temp_arr,
+                include_assay_context=self.predictor.include_assay_context,
+            )
+            preds[start:end] = self.predictor.model.predict(matrix)
+
         result = self.ligands.copy()
-        result["P(Active)"] = preds.astype(np.float64)
-        result = result.dropna(subset=["P(Active)"])
+        result["P(Active)"] = preds
         result = result.sort_values("P(Active)", ascending=False, kind="mergesort")
         return result.reset_index(drop=True)
 
