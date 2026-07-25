@@ -12,6 +12,7 @@ Public demo link (while this process is running)::
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import tempfile
 from typing import Any, Optional
@@ -24,10 +25,390 @@ from src.screen_library import (
     DEFAULT_MODEL,
     ScreenLibrary,
 )
-from src.uniprot_search import UniProtHit, fetch_sequence, search_swissprot
+from src.uniprot_search import fetch_sequence, search_swissprot
 
 _SCREEN: Optional[ScreenLibrary] = None
-_LABEL_TO_HIT: dict[str, UniProtHit] = {}
+
+_PROTEIN_PICKER_HTML = """
+<div class="protein-picker">
+  <div class="picker-label">Protein name / gene / accession</div>
+  <div class="picker-field">
+    <div class="chip" hidden tabindex="0">
+      <span class="chip-text"></span>
+      <button type="button" class="chip-x" aria-label="Clear selection">&times;</button>
+    </div>
+    <input
+      class="picker-input"
+      type="text"
+      placeholder="e.g. NPY1R, TSHR, ghrelin receptor…"
+      autocomplete="off"
+      spellcheck="false"
+    />
+    <ul class="picker-dropdown" hidden></ul>
+  </div>
+</div>
+"""
+
+_PROTEIN_PICKER_CSS = """
+.protein-picker {
+    width: 100%;
+    font-family: inherit;
+}
+.picker-label {
+    font-size: var(--block-title-text-size, 1rem);
+    font-weight: var(--block-title-text-weight, 600);
+    margin-bottom: 0.4rem;
+    color: var(--body-text-color, inherit);
+}
+.picker-field {
+    position: relative;
+    width: 100%;
+}
+.picker-input {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 0.55rem 0.75rem;
+    border: 1px solid var(--border-color-primary, #c0c0c0);
+    border-radius: 6px;
+    background: var(--input-background-fill, #fff);
+    color: inherit;
+    font: inherit;
+    font-size: 1rem;
+    outline: none;
+}
+.picker-input:focus {
+    border-color: var(--color-accent, #2563eb);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent, #2563eb) 25%, transparent);
+}
+.chip {
+    display: none;
+    align-items: center;
+    gap: 0.35rem;
+    max-width: 100%;
+    box-sizing: border-box;
+    padding: 0.35rem 0.35rem 0.35rem 0.7rem;
+    border: 1px solid var(--border-color-primary, #c0c0c0);
+    border-radius: 999px;
+    background: var(--background-fill-secondary, #eef2ff);
+    color: inherit;
+    font: inherit;
+    font-size: 0.95rem;
+    outline: none;
+    cursor: default;
+    user-select: text;
+}
+.chip:not([hidden]) {
+    display: inline-flex;
+}
+.chip[hidden] {
+    display: none !important;
+}
+.chip:focus {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent, #2563eb) 30%, transparent);
+}
+.chip-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: min(100%, 52rem);
+}
+.chip-x {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.5rem;
+    height: 1.5rem;
+    border: none;
+    border-radius: 999px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: 1.15rem;
+    line-height: 1;
+    cursor: pointer;
+}
+.chip-x:hover {
+    background: color-mix(in srgb, currentColor 12%, transparent);
+}
+.picker-dropdown {
+    display: none;
+    position: absolute;
+    top: calc(100% + 2px);
+    left: 0;
+    right: 0;
+    z-index: 50;
+    margin: 0;
+    padding: 0.25rem 0;
+    list-style: none;
+    max-height: 16rem;
+    overflow-y: auto;
+    border: 1px solid var(--border-color-primary, #c0c0c0);
+    border-radius: 6px;
+    background: var(--background-fill-primary, #fff);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+.picker-dropdown:not([hidden]) {
+    display: block;
+}
+.picker-dropdown[hidden] {
+    display: none !important;
+}
+.picker-dropdown li {
+    padding: 0.55rem 0.75rem;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.95rem;
+}
+.picker-dropdown li:hover,
+.picker-dropdown li.active {
+    background: var(--background-fill-secondary, #f3f4f6);
+}
+.picker-dropdown .empty {
+    color: var(--body-text-color-subdued, #666);
+    cursor: default;
+}
+.picker-dropdown .empty:hover {
+    background: transparent;
+}
+"""
+
+_PROTEIN_PICKER_JS = r"""
+(() => {
+  let debounceTimer = null;
+  let requestId = 0;
+  let activeIndex = -1;
+  let currentHits = [];
+
+  function qs(sel) {
+    return element.querySelector(sel);
+  }
+
+  function hideDropdown() {
+    const dropdown = qs(".picker-dropdown");
+    if (!dropdown) return;
+    dropdown.hidden = true;
+    dropdown.innerHTML = "";
+    activeIndex = -1;
+    currentHits = [];
+  }
+
+  function showTypingMode() {
+    const chip = qs(".chip");
+    const chipText = qs(".chip-text");
+    const input = qs(".picker-input");
+    if (chip) chip.hidden = true;
+    if (chipText) chipText.textContent = "";
+    if (input) {
+      input.hidden = false;
+      input.disabled = false;
+    }
+    hideDropdown();
+  }
+
+  function showChipMode(label) {
+    const chip = qs(".chip");
+    const chipText = qs(".chip-text");
+    const input = qs(".picker-input");
+    hideDropdown();
+    if (input) {
+      input.hidden = true;
+      input.value = "";
+      input.disabled = false;
+    }
+    if (chipText) chipText.textContent = label || "";
+    if (chip) {
+      chip.hidden = false;
+      chip.focus();
+    }
+  }
+
+  function setSelection(payload) {
+    props.value = payload;
+    trigger("change");
+  }
+
+  function clearSelection() {
+    showTypingMode();
+    setSelection(null);
+    const input = qs(".picker-input");
+    if (input) input.focus();
+  }
+
+  function renderDropdown(hits) {
+    const dropdown = qs(".picker-dropdown");
+    if (!dropdown) return;
+    currentHits = Array.isArray(hits) ? hits : [];
+    dropdown.innerHTML = "";
+    activeIndex = -1;
+    if (!currentHits.length) {
+      const li = document.createElement("li");
+      li.className = "empty";
+      li.textContent = "No Swiss-Prot matches";
+      dropdown.appendChild(li);
+      dropdown.hidden = false;
+      return;
+    }
+    currentHits.forEach((hit) => {
+      const li = document.createElement("li");
+      li.textContent = hit.label || hit.accession || "";
+      li.dataset.accession = hit.accession || "";
+      dropdown.appendChild(li);
+    });
+    dropdown.hidden = false;
+  }
+
+  function highlightActive() {
+    const dropdown = qs(".picker-dropdown");
+    if (!dropdown) return;
+    const items = dropdown.querySelectorAll("li:not(.empty)");
+    items.forEach((item, index) => {
+      item.classList.toggle("active", index === activeIndex);
+    });
+    if (activeIndex >= 0 && items[activeIndex]) {
+      items[activeIndex].scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  async function selectHit(hit) {
+    if (!hit || !hit.accession) return;
+    const input = qs(".picker-input");
+    hideDropdown();
+    if (input) input.disabled = true;
+    try {
+      const resolved = await server.resolve_protein(hit.accession);
+      if (!resolved || !resolved.sequence) {
+        if (input) input.disabled = false;
+        return;
+      }
+      const label = resolved.label || hit.label || resolved.accession;
+      showChipMode(label);
+      setSelection({
+        accession: resolved.accession,
+        sequence: resolved.sequence,
+        label: label,
+      });
+    } catch (err) {
+      console.error(err);
+      showTypingMode();
+      setSelection(null);
+    } finally {
+      if (input) input.disabled = false;
+    }
+  }
+
+  async function runSearch(query) {
+    const id = ++requestId;
+    const q = (query || "").trim();
+    if (q.length < 2) {
+      hideDropdown();
+      return;
+    }
+    try {
+      const hits = await server.search_proteins(q);
+      if (id !== requestId) return;
+      renderDropdown(hits);
+    } catch (err) {
+      if (id !== requestId) return;
+      const dropdown = qs(".picker-dropdown");
+      if (!dropdown) return;
+      dropdown.innerHTML = "";
+      const li = document.createElement("li");
+      li.className = "empty";
+      li.textContent = "Search failed";
+      dropdown.appendChild(li);
+      dropdown.hidden = false;
+      currentHits = [];
+    }
+  }
+
+  function syncFromValue() {
+    const value = props.value;
+    if (value && value.label && value.sequence) {
+      showChipMode(value.label);
+    } else {
+      const chip = qs(".chip");
+      const input = qs(".picker-input");
+      if (chip) chip.hidden = true;
+      if (input) input.hidden = false;
+      hideDropdown();
+    }
+  }
+
+  element.addEventListener("input", (event) => {
+    if (!event.target.classList.contains("picker-input")) return;
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => runSearch(event.target.value), 300);
+  });
+
+  element.addEventListener("keydown", (event) => {
+    const input = qs(".picker-input");
+    const chip = qs(".chip");
+    const dropdown = qs(".picker-dropdown");
+
+    if (chip && !chip.hidden && (event.key === "Backspace" || event.key === "Delete")) {
+      if (event.target === chip || chip.contains(event.target) || event.target === element) {
+        event.preventDefault();
+        clearSelection();
+      }
+      return;
+    }
+
+    if (!input || input.hidden || !dropdown || dropdown.hidden || !currentHits.length) return;
+    if (event.target !== input) return;
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      activeIndex = Math.min(activeIndex + 1, currentHits.length - 1);
+      highlightActive();
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      activeIndex = Math.max(activeIndex - 1, 0);
+      highlightActive();
+    } else if (event.key === "Enter") {
+      if (activeIndex >= 0 && currentHits[activeIndex]) {
+        event.preventDefault();
+        selectHit(currentHits[activeIndex]);
+      }
+    } else if (event.key === "Escape") {
+      hideDropdown();
+    }
+  });
+
+  element.addEventListener("mousedown", (event) => {
+    const li = event.target.closest(".picker-dropdown li");
+    if (!li || li.classList.contains("empty")) return;
+    event.preventDefault();
+    const accession = li.dataset.accession;
+    const hit = currentHits.find((h) => h.accession === accession) || {
+      accession,
+      label: li.textContent,
+    };
+    selectHit(hit);
+  });
+
+  element.addEventListener("click", (event) => {
+    if (event.target.closest(".chip-x")) {
+      event.preventDefault();
+      event.stopPropagation();
+      clearSelection();
+    }
+  });
+
+  document.addEventListener("click", (event) => {
+    const field = qs(".picker-field");
+    if (field && !field.contains(event.target)) {
+      hideDropdown();
+    }
+  });
+
+  watch("value", () => {
+    syncFromValue();
+  });
+
+  syncFromValue();
+})();
+"""
 
 
 def _get_screen(model_path: str, ligand_map_path: str) -> ScreenLibrary:
@@ -51,68 +432,81 @@ def _get_screen(model_path: str, ligand_map_path: str) -> ScreenLibrary:
     return _SCREEN
 
 
-def on_search(query: str) -> Any:
-    """Update Swiss-Prot suggestions under the search box.
+def search_proteins(query: str) -> list[dict[str, str]]:
+    """Search Swiss-Prot and return suggestion dicts for the HTML picker.
 
     Args:
         query: Free-text protein / gene / accession query.
 
     Returns:
-        A Gradio Radio update with clickable suggestion labels.
+        A list of ``{"accession", "label"}`` dicts (may be empty).
     """
-    global _LABEL_TO_HIT
     try:
         hits = search_swissprot(query, size=10, human_only=True)
-    except Exception as exc:  # noqa: BLE001 — surface API errors in the UI
-        _LABEL_TO_HIT = {}
-        return gr.update(
-            choices=[],
-            value=None,
-            label=f"Suggestions (search failed: {exc})",
-        )
-    _LABEL_TO_HIT = {hit.label: hit for hit in hits}
-    labels = [hit.label for hit in hits]
-    return gr.update(
-        choices=labels,
-        value=None,
-        label="Suggestions (click to select)",
-    )
+    except Exception:  # noqa: BLE001 — surface empty list in the UI dropdown
+        return []
+    return [{"accession": hit.accession, "label": hit.label} for hit in hits]
 
 
-def on_select_suggestion(
-    label: Optional[str],
-) -> tuple[str, str, str]:
-    """Resolve a clicked suggestion to a UniProt sequence.
+def resolve_protein(accession: str) -> dict[str, Any]:
+    """Fetch a UniProt sequence and build chip payload fields.
 
     Args:
-        label: Selected Radio label.
+        accession: UniProt primary accession.
 
     Returns:
-        Tuple of ``(status_markdown, accession, sequence)``.
+        Dict with ``accession``, ``label``, ``sequence``, ``gene``,
+        ``protein_name``, ``organism``, and ``length``.
+
+    Raises:
+        ValueError: If the accession cannot be resolved.
     """
-    if not label or label not in _LABEL_TO_HIT:
-        return (
-            "_No protein selected._",
-            "",
-            "",
-        )
-    hit = _LABEL_TO_HIT[label]
-    try:
-        entry = fetch_sequence(hit.accession)
-    except Exception as exc:  # noqa: BLE001
-        return (
-            f"**Failed to fetch sequence for {hit.accession}:** {exc}",
-            "",
-            "",
-        )
-    name = entry.gene or entry.protein_name or entry.accession
-    status = (
-        f"**Selected:** {name}  \n"
-        f"**Accession:** `{entry.accession}`  \n"
-        f"**Organism:** {entry.organism or 'n/a'}  \n"
-        f"**Sequence length:** {len(entry.sequence)} aa"
-    )
-    return status, entry.accession, entry.sequence
+    entry = fetch_sequence(accession)
+    gene = entry.gene
+    protein_name = entry.protein_name
+    if gene and protein_name:
+        label = f"{gene} — {protein_name} ({entry.accession})"
+    elif protein_name:
+        label = f"{protein_name} ({entry.accession})"
+    elif gene:
+        label = f"{gene} ({entry.accession})"
+    else:
+        label = entry.accession
+    if entry.organism and entry.organism.lower() != "homo sapiens":
+        label = f"{label} [{entry.organism}]"
+    return {
+        "accession": entry.accession,
+        "label": label,
+        "sequence": entry.sequence,
+        "gene": gene,
+        "protein_name": protein_name,
+        "organism": entry.organism,
+        "length": len(entry.sequence),
+    }
+
+
+def on_protein_change(value: Any) -> tuple[str, str]:
+    """Parse the HTML picker value into accession and sequence states.
+
+    Args:
+        value: Picker payload dict, JSON string, or ``None``.
+
+    Returns:
+        Tuple of ``(accession, sequence)``.
+    """
+    if value is None or value == "" or value == {}:
+        return "", ""
+    payload = value
+    if isinstance(value, str):
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError:
+            return "", ""
+    if not isinstance(payload, dict):
+        return "", ""
+    accession = str(payload.get("accession") or "").strip()
+    sequence = str(payload.get("sequence") or "").strip()
+    return accession, sequence
 
 
 def _format_bytes(n_bytes: int) -> str:
@@ -197,7 +591,7 @@ def on_run_screen(
     return gallery, download_update, status
 
 
-_GALLERY_CAPTION_CSS = """
+_APP_CSS = """
 html, body, .gradio-container,
 .gradio-container button, .gradio-container input,
 .gradio-container textarea, .gradio-container label,
@@ -236,6 +630,9 @@ html, body, .gradio-container,
     font-size: 1.15rem !important;
     font-weight: 600 !important;
 }
+#protein-picker {
+    margin-bottom: 0.5rem;
+}
 """
 
 
@@ -252,30 +649,26 @@ def build_app(model_path: str, ligand_map_path: str) -> gr.Blocks:
     with gr.Blocks(title="GPCR Library Screen") as demo:
         gr.Markdown(
             """
-# GPCR sequence library screen
+# GPCR-Predictor Demo
 
-Search **Swiss-Prot** (human) for a protein, then score it against the
-**Sytravon** + **Genesis** ligand libraries. Top 10 hits are shown with
-structures; download the full CSV of `SMILES`, `ID`, `dataset`, and `P(Active)`.
+Run AI-based virtual screening on the Sytravon and Genesis ligand libraries.
             """.strip()
         )
 
         accession_state = gr.State("")
         sequence_state = gr.State("")
 
-        with gr.Row():
-            query = gr.Textbox(
-                label="Protein name / gene / accession",
-                placeholder="e.g. NPY1R, TSHR, ghrelin receptor…",
-                scale=3,
-            )
-            search_btn = gr.Button("Search", scale=1)
-        suggestions = gr.Radio(
-            choices=[],
-            label="Suggestions (click to select)",
-            interactive=True,
+        protein_picker = gr.HTML(
+            value=None,
+            label="Protein",
+            html_template=_PROTEIN_PICKER_HTML,
+            css_template=_PROTEIN_PICKER_CSS,
+            js_on_load=_PROTEIN_PICKER_JS,
+            server_functions=[search_proteins, resolve_protein],
+            elem_id="protein-picker",
+            padding=False,
+            container=False,
         )
-        selected = gr.Markdown("_No protein selected._")
 
         run_btn = gr.Button("Run library screen", variant="primary")
         status = gr.Markdown("")
@@ -307,12 +700,10 @@ structures; download the full CSV of `SMILES`, `ID`, `dataset`, and `P(Active)`.
             """
             return on_run_screen(sequence, accession, model_path, ligand_map_path)
 
-        search_btn.click(fn=on_search, inputs=[query], outputs=[suggestions])
-        query.submit(fn=on_search, inputs=[query], outputs=[suggestions])
-        suggestions.change(
-            fn=on_select_suggestion,
-            inputs=[suggestions],
-            outputs=[selected, accession_state, sequence_state],
+        protein_picker.change(
+            fn=on_protein_change,
+            inputs=[protein_picker],
+            outputs=[accession_state, sequence_state],
         )
         run_btn.click(
             fn=_run,
@@ -375,7 +766,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         share=bool(args.share),
         server_name=args.server_name,
         server_port=int(args.server_port),
-        css=_GALLERY_CAPTION_CSS,
+        css=_APP_CSS,
     )
 
 
