@@ -179,6 +179,7 @@ _PROTEIN_PICKER_JS = r"""
   let requestId = 0;
   let activeIndex = -1;
   let currentHits = [];
+  let searchPromise = null;
 
   function qs(sel) {
     return element.querySelector(sel);
@@ -302,24 +303,50 @@ _PROTEIN_PICKER_JS = r"""
     const q = (query || "").trim();
     if (q.length < 2) {
       hideDropdown();
-      return;
+      searchPromise = null;
+      return [];
     }
-    try {
-      const hits = await server.search_proteins(q);
-      if (id !== requestId) return;
-      renderDropdown(hits);
-    } catch (err) {
-      if (id !== requestId) return;
-      const dropdown = qs(".picker-dropdown");
-      if (!dropdown) return;
-      dropdown.innerHTML = "";
-      const li = document.createElement("li");
-      li.className = "empty";
-      li.textContent = "Search failed";
-      dropdown.appendChild(li);
-      dropdown.hidden = false;
-      currentHits = [];
+    searchPromise = (async () => {
+      try {
+        const hits = await server.search_proteins(q);
+        if (id !== requestId) return currentHits;
+        renderDropdown(hits);
+        return currentHits;
+      } catch (err) {
+        if (id !== requestId) return currentHits;
+        const dropdown = qs(".picker-dropdown");
+        if (!dropdown) return [];
+        dropdown.innerHTML = "";
+        const li = document.createElement("li");
+        li.className = "empty";
+        li.textContent = "Search failed";
+        dropdown.appendChild(li);
+        dropdown.hidden = false;
+        currentHits = [];
+        return [];
+      } finally {
+        if (id === requestId) {
+          searchPromise = null;
+        }
+      }
+    })();
+    return searchPromise;
+  }
+
+  async function selectTopOrActiveHit() {
+    if (searchPromise) {
+      await searchPromise;
     }
+    if (!currentHits.length) {
+      const input = qs(".picker-input");
+      const q = ((input && input.value) || "").trim();
+      if (q.length >= 2) {
+        await runSearch(q);
+      }
+    }
+    if (!currentHits.length) return;
+    const idx = activeIndex >= 0 ? activeIndex : 0;
+    await selectHit(currentHits[idx]);
   }
 
   function syncFromValue() {
@@ -354,8 +381,17 @@ _PROTEIN_PICKER_JS = r"""
       return;
     }
 
-    if (!input || input.hidden || !dropdown || dropdown.hidden || !currentHits.length) return;
-    if (event.target !== input) return;
+    if (!input || input.hidden || event.target !== input) return;
+
+    if (event.key === "Enter") {
+      event.preventDefault();
+      event.stopPropagation();
+      clearTimeout(debounceTimer);
+      selectTopOrActiveHit();
+      return;
+    }
+
+    if (!dropdown || dropdown.hidden || !currentHits.length) return;
 
     if (event.key === "ArrowDown") {
       event.preventDefault();
@@ -365,11 +401,6 @@ _PROTEIN_PICKER_JS = r"""
       event.preventDefault();
       activeIndex = Math.max(activeIndex - 1, 0);
       highlightActive();
-    } else if (event.key === "Enter") {
-      if (activeIndex >= 0 && currentHits[activeIndex]) {
-        event.preventDefault();
-        selectHit(currentHits[activeIndex]);
-      }
     } else if (event.key === "Escape") {
       hideDropdown();
     }
