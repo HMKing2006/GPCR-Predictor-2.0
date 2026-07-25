@@ -529,12 +529,31 @@ def _format_bytes(n_bytes: int) -> str:
     return f"{n_bytes} B"
 
 
+def begin_screen_ui() -> tuple[Any, Any, str]:
+    """Reveal results UI immediately when a screen is started.
+
+    Returns:
+        Tuple of ``(gallery_update, download_button_update, status)`` with the
+        gallery and download button visible and the download control disabled.
+    """
+    return (
+        gr.update(visible=True, value=None),
+        gr.update(
+            visible=True,
+            interactive=False,
+            value=None,
+            label="Download Full Results",
+        ),
+        "Screening…",
+    )
+
+
 def on_run_screen(
     sequence: str,
     accession: str,
     model_path: str,
     ligand_map_path: str,
-) -> tuple[list[tuple[Any, str]], Any, str]:
+) -> tuple[Any, Any, str]:
     """Screen the selected protein against Sytravon + Genesis.
 
     Args:
@@ -544,26 +563,24 @@ def on_run_screen(
         ligand_map_path: Ligand ID map path.
 
     Returns:
-        Tuple of ``(gallery_items, download_button_update, status)``.
+        Tuple of ``(gallery_update, download_button_update, status)``.
     """
+    hidden_download = gr.update(
+        value=None,
+        label="Download Full Results",
+        interactive=False,
+        visible=False,
+    )
     seq = str(sequence or "").strip()
     if not seq:
-        return (
-            [],
-            gr.update(value=None, label="Download Full Results", interactive=False),
-            "No protein selected.",
-        )
+        return gr.update(value=None, visible=False), hidden_download, "No protein selected."
 
     try:
         screen = _get_screen(model_path, ligand_map_path)
         results = screen.screen(seq)
         hits = screen.top_hits(results, k=10)
     except Exception as exc:  # noqa: BLE001
-        return (
-            [],
-            gr.update(value=None, label="Download Full Results", interactive=False),
-            f"Error: {exc}",
-        )
+        return gr.update(value=None, visible=False), hidden_download, f"Error: {exc}"
 
     gallery: list[tuple[Any, str]] = []
     for hit in hits:
@@ -586,9 +603,10 @@ def on_run_screen(
         value=csv_path,
         label=f"Download Full Results ({size_label})",
         interactive=True,
+        visible=True,
     )
     status = f"Scored {len(results):,} ligands."
-    return gallery, download_update, status
+    return gr.update(value=gallery, visible=True), download_update, status
 
 
 _APP_CSS = """
@@ -649,7 +667,7 @@ def build_app(model_path: str, ligand_map_path: str) -> gr.Blocks:
     with gr.Blocks(title="GPCR Library Screen") as demo:
         gr.Markdown(
             """
-# GPCR-Predictor Demo
+# GPCR Predictor Demo
 
 Run AI-based virtual screening on the Sytravon and Genesis ligand libraries.
             """.strip()
@@ -670,7 +688,7 @@ Run AI-based virtual screening on the Sytravon and Genesis ligand libraries.
             container=False,
         )
 
-        run_btn = gr.Button("Run library screen", variant="primary")
+        run_btn = gr.Button("Run virtual screen", variant="primary")
         status = gr.Markdown("")
 
         gallery = gr.Gallery(
@@ -678,6 +696,7 @@ Run AI-based virtual screening on the Sytravon and Genesis ligand libraries.
             columns=2,
             height="auto",
             object_fit="contain",
+            visible=False,
         )
         download_btn = gr.DownloadButton(
             label="Download Full Results",
@@ -685,10 +704,11 @@ Run AI-based virtual screening on the Sytravon and Genesis ligand libraries.
             variant="primary",
             size="lg",
             interactive=False,
+            visible=False,
             elem_id="download-full-results",
         )
 
-        def _run(sequence: str, accession: str) -> tuple[list[tuple[Any, str]], Any, str]:
+        def _run(sequence: str, accession: str) -> tuple[Any, Any, str]:
             """Run screening with the app's fixed model and ligand map paths.
 
             Args:
@@ -696,7 +716,7 @@ Run AI-based virtual screening on the Sytravon and Genesis ligand libraries.
                 accession: UniProt accession (for CSV naming).
 
             Returns:
-                Tuple of ``(gallery_items, download_button_update, status)``.
+                Tuple of ``(gallery_update, download_button_update, status)``.
             """
             return on_run_screen(sequence, accession, model_path, ligand_map_path)
 
@@ -706,6 +726,10 @@ Run AI-based virtual screening on the Sytravon and Genesis ligand libraries.
             outputs=[accession_state, sequence_state],
         )
         run_btn.click(
+            fn=begin_screen_ui,
+            inputs=None,
+            outputs=[gallery, download_btn, status],
+        ).then(
             fn=_run,
             inputs=[sequence_state, accession_state],
             outputs=[gallery, download_btn, status],
