@@ -636,7 +636,7 @@ def on_run_screen(
         interactive=True,
         visible=True,
     )
-    status = f"Scored {len(results):,} ligands."
+    status = f"Screened {len(results):,} ligands."
     return gr.update(value=gallery, visible=True), download_update, status
 
 
@@ -678,6 +678,37 @@ html, body, .gradio-container,
     min-height: 3.25rem !important;
     font-size: 1.15rem !important;
     font-weight: 600 !important;
+}
+/* Let all top-10 tiles expand the page (no inner gallery scrollbar). */
+#top-hits-gallery .grid-wrap.fixed-height,
+#top-hits-gallery .grid-wrap {
+    max-height: none !important;
+    min-height: 0 !important;
+    height: auto !important;
+    overflow: visible !important;
+}
+/* Enlarged hit: ~2 tile widths × 1 tile height (not the full 5-row gallery). */
+#top-hits-gallery .preview {
+    position: fixed !important;
+    inset: auto !important;
+    top: 50% !important;
+    left: 50% !important;
+    transform: translate(-50%, -50%);
+    width: min(920px, 92vw) !important;
+    height: auto !important;
+    aspect-ratio: 2 / 1;
+    max-height: min(50vh, 460px);
+    z-index: 1000 !important;
+    box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.35);
+}
+#top-hits-gallery .preview .media-button {
+    height: calc(100% - 4.5rem) !important;
+    width: 100% !important;
+}
+#top-hits-gallery .preview img.with-caption {
+    height: 100% !important;
+    width: 100% !important;
+    object-fit: contain !important;
 }
 #protein-picker {
     margin-bottom: 0.5rem;
@@ -728,6 +759,7 @@ Run AI-based virtual screening on the Sytravon and Genesis ligand libraries.
             height="auto",
             object_fit="contain",
             visible=False,
+            elem_id="top-hits-gallery",
         )
         download_btn = gr.DownloadButton(
             label="Download Full Results",
