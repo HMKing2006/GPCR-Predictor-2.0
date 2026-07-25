@@ -12,3 +12,4 @@ xlrd>=2.0
 xlwt>=1.3
 tqdm>=4.66
 papyrus-scripts>=2.0
+gradio>=4.0

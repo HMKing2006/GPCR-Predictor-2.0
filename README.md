@@ -398,6 +398,32 @@ at most 50 nM (matching the training threshold). Spreadsheet outputs are named
 reloads the ligand representation and assay-context setting from the saved
 model's metadata.
 
+## Screening GUI
+
+A Gradio app screens one Swiss-Prot protein (name/gene search → sequence fetch)
+against the Sytravon + Genesis libraries under `data/screen/`, shows the top 10
+hits with RDKit depictions, and offers a CSV download (`SMILES`, `ID`,
+`dataset`, `P(Active)`).
+
+Requires `gradio` (in `requirements.txt`), a trained pair model (default
+`models/mlp_512x2_time_morgan_descriptors.joblib`), and
+`data/screen/ligand_id_map.tsv`.
+
+```bash
+# Local UI (http://127.0.0.1:7860)
+python app.py
+
+# Temporary public demo link (*.gradio.live) while this process is running
+python app.py --share
+
+# Optional: skip ligand warm-up at startup (warms on first Run instead)
+python app.py --no-warm
+```
+
+On first launch the app loads ESM-2 and warms ~168k ligand features from the
+LMDB caches (fast when caches are already populated from a prior `predict.py`
+screen). Each Run embeds the selected protein once and scores the full library.
+
 ## Ligand multilabel (experimental)
 
 Isolated ligand-centric **family** and **target** multilabel models under
@@ -493,6 +519,9 @@ src/io_utils.py      Spreadsheet / SMILES / SDF / FASTA IO.
 train.py             Train one model.
 grid_search.py       Search model types and hyperparameters.
 predict.py           Four prediction modes.
+app.py               Gradio Swiss-Prot → Sytravon/Genesis screening GUI.
+src/uniprot_search.py  Swiss-Prot search + sequence fetch (disk-cached).
+src/screen_library.py  Library load, screen, RDKit depictions, CSV export.
 
 # Experimental ligand multilabel (deletable)
 src/multilabel/              Isolated family/target multilabel package.
