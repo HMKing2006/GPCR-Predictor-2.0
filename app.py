@@ -103,8 +103,10 @@ _PROTEIN_PICKER_CSS = """
 .chip[hidden] {
     display: none !important;
 }
-.chip:focus {
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent, #2563eb) 30%, transparent);
+.chip:focus,
+.chip:focus-visible {
+    outline: none !important;
+    box-shadow: none !important;
 }
 .chip-text {
     overflow: hidden;
@@ -288,6 +290,7 @@ _PROTEIN_PICKER_JS = r"""
         accession: resolved.accession,
         sequence: resolved.sequence,
         label: label,
+        gene: resolved.gene || "",
       });
     } catch (err) {
       console.error(err);
@@ -516,28 +519,37 @@ def resolve_protein(accession: str) -> dict[str, Any]:
     }
 
 
-def on_protein_change(value: Any) -> tuple[str, str]:
-    """Parse the HTML picker value into accession and sequence states.
+def on_protein_change(value: Any) -> tuple[str, str, str]:
+    """Parse the HTML picker value into accession, sequence, and display name.
 
     Args:
         value: Picker payload dict, JSON string, or ``None``.
 
     Returns:
-        Tuple of ``(accession, sequence)``.
+        Tuple of ``(accession, sequence, protein_name)``.
     """
     if value is None or value == "" or value == {}:
-        return "", ""
+        return "", "", ""
     payload = value
     if isinstance(value, str):
         try:
             payload = json.loads(value)
         except json.JSONDecodeError:
-            return "", ""
+            return "", "", ""
     if not isinstance(payload, dict):
-        return "", ""
+        return "", "", ""
     accession = str(payload.get("accession") or "").strip()
     sequence = str(payload.get("sequence") or "").strip()
-    return accession, sequence
+    gene = str(payload.get("gene") or "").strip()
+    if not gene:
+        label = str(payload.get("label") or "").strip()
+        if "—" in label:
+            gene = label.split("—", 1)[0].strip()
+        elif label:
+            gene = label
+        else:
+            gene = accession
+    return accession, sequence, gene
 
 
 def _format_bytes(n_bytes: int) -> str:
@@ -565,7 +577,8 @@ def begin_screen_ui() -> tuple[Any, Any, str]:
 
     Returns:
         Tuple of ``(gallery_update, download_button_update, status)`` with the
-        gallery and download button visible and the download control disabled.
+        gallery and download button visible, download disabled, and status cleared
+        until screening finishes.
     """
     return (
         gr.update(visible=True, value=None),
@@ -575,13 +588,14 @@ def begin_screen_ui() -> tuple[Any, Any, str]:
             value=None,
             label="Download Full Results",
         ),
-        "Screening…",
+        "",
     )
 
 
 def on_run_screen(
     sequence: str,
     accession: str,
+    protein_name: str,
     model_path: str,
     ligand_map_path: str,
 ) -> tuple[Any, Any, str]:
@@ -590,6 +604,7 @@ def on_run_screen(
     Args:
         sequence: Amino-acid sequence.
         accession: UniProt accession (for CSV naming).
+        protein_name: Short display name (e.g. gene symbol) for the results title.
         model_path: Joblib model path.
         ligand_map_path: Ligand ID map path.
 
@@ -636,7 +651,11 @@ def on_run_screen(
         interactive=True,
         visible=True,
     )
-    status = f"Screened {len(results):,} ligands."
+    name = str(protein_name or accession or "protein").strip() or "protein"
+    status = (
+        f"Screened {len(results):,} ligands.\n\n"
+        f"# Top {name} hits:"
+    )
     return gr.update(value=gallery, visible=True), download_update, status
 
 
@@ -646,31 +665,6 @@ html, body, .gradio-container,
 .gradio-container textarea, .gradio-container label,
 .gradio-container .prose, .gradio-container markdown {
     font-family: "Sinhala Sangam MN", Georgia, serif !important;
-}
-.caption {
-    white-space: normal !important;
-    overflow-wrap: anywhere !important;
-    word-break: break-all !important;
-    text-overflow: clip !important;
-    overflow-y: auto !important;
-    max-height: 28vh;
-    max-width: 100% !important;
-    align-self: stretch !important;
-}
-/* Hide the preview strip of all gallery thumbnails (covers SMILES). */
-.preview .thumbnails {
-    display: none !important;
-}
-/* Grid tile captions: span bottom edge; ellipsis inside the tile. */
-.caption-label {
-    left: var(--block-label-margin) !important;
-    right: var(--block-label-margin) !important;
-    max-width: none !important;
-    width: auto !important;
-    text-align: left !important;
-    overflow: hidden !important;
-    white-space: nowrap !important;
-    text-overflow: ellipsis !important;
 }
 /* Full-width prominent CSV download button. */
 #download-full-results button {
@@ -687,28 +681,81 @@ html, body, .gradio-container,
     height: auto !important;
     overflow: visible !important;
 }
-/* Enlarged hit: ~2 tile widths × 1 tile height (not the full 5-row gallery). */
-#top-hits-gallery .preview {
-    position: fixed !important;
-    inset: auto !important;
-    top: 50% !important;
-    left: 50% !important;
-    transform: translate(-50%, -50%);
-    width: min(920px, 92vw) !important;
+#top-hits-gallery .grid-container {
+    grid-auto-rows: auto !important;
+}
+#top-hits-gallery .thumbnail-item.thumbnail-lg {
+    aspect-ratio: auto !important;
     height: auto !important;
-    aspect-ratio: 2 / 1;
-    max-height: min(50vh, 460px);
-    z-index: 1000 !important;
-    box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.35);
+    overflow: visible !important;
+    display: flex !important;
+    flex-direction: column !important;
+    background: transparent !important;
 }
-#top-hits-gallery .preview .media-button {
-    height: calc(100% - 4.5rem) !important;
-    width: 100% !important;
+#top-hits-gallery .gallery-item {
+    height: auto !important;
+    display: flex !important;
+    flex-direction: column !important;
 }
-#top-hits-gallery .preview img.with-caption {
-    height: 100% !important;
+#top-hits-gallery .gallery-item > button,
+#top-hits-gallery .thumbnail-lg > button {
+    height: auto !important;
+    display: flex !important;
+    flex-direction: column !important;
+    background: transparent !important;
+}
+#top-hits-gallery .thumbnail-lg > img,
+#top-hits-gallery .gallery-item img {
     width: 100% !important;
+    height: auto !important;
+    aspect-ratio: auto !important;
     object-fit: contain !important;
+    display: block !important;
+    background: transparent !important;
+}
+/* SMILES captions: full text, wrap under the structure, selectable. */
+#top-hits-gallery .caption-label {
+    position: static !important;
+    inset: auto !important;
+    display: block !important;
+    max-width: 100% !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+    margin-top: 0.35rem !important;
+    padding: 0.35rem 0.4rem !important;
+    border: 1px solid var(--border-color-primary, #c0c0c0) !important;
+    border-radius: var(--block-label-radius, 4px) !important;
+    background: var(--background-fill-secondary, #f3f4f6) !important;
+    text-align: left !important;
+    white-space: normal !important;
+    overflow: visible !important;
+    text-overflow: unset !important;
+    overflow-wrap: anywhere !important;
+    word-break: break-all !important;
+    user-select: text !important;
+    cursor: text !important;
+    opacity: 1 !important;
+    font-size: 0.85rem !important;
+    line-height: 1.35 !important;
+}
+/* No hover / focus / selected edge highlights on ligand tiles. */
+#top-hits-gallery .thumbnail-item,
+#top-hits-gallery .thumbnail-item:hover,
+#top-hits-gallery .thumbnail-item.selected,
+#top-hits-gallery .thumbnail-item:focus,
+#top-hits-gallery .thumbnail-item:focus-visible,
+#top-hits-gallery .gallery-item > button,
+#top-hits-gallery .gallery-item > button:hover,
+#top-hits-gallery .gallery-item > button:focus,
+#top-hits-gallery .gallery-item > button:focus-visible {
+    --ring-color: transparent !important;
+    outline: none !important;
+    box-shadow: none !important;
+    border-color: var(--border-color-primary, #c0c0c0) !important;
+    filter: none !important;
+}
+#top-hits-gallery .thumbnail-item:hover .caption-label {
+    opacity: 1 !important;
 }
 #protein-picker {
     margin-bottom: 0.5rem;
@@ -737,6 +784,7 @@ Run AI-based virtual screening on the Sytravon and Genesis ligand libraries.
 
         accession_state = gr.State("")
         sequence_state = gr.State("")
+        protein_name_state = gr.State("")
 
         protein_picker = gr.HTML(
             value=None,
@@ -758,6 +806,8 @@ Run AI-based virtual screening on the Sytravon and Genesis ligand libraries.
             columns=2,
             height="auto",
             object_fit="contain",
+            allow_preview=False,
+            show_label=False,
             visible=False,
             elem_id="top-hits-gallery",
         )
@@ -771,22 +821,27 @@ Run AI-based virtual screening on the Sytravon and Genesis ligand libraries.
             elem_id="download-full-results",
         )
 
-        def _run(sequence: str, accession: str) -> tuple[Any, Any, str]:
+        def _run(
+            sequence: str, accession: str, protein_name: str
+        ) -> tuple[Any, Any, str]:
             """Run screening with the app's fixed model and ligand map paths.
 
             Args:
                 sequence: Amino-acid sequence.
                 accession: UniProt accession (for CSV naming).
+                protein_name: Short display name for the results title.
 
             Returns:
                 Tuple of ``(gallery_update, download_button_update, status)``.
             """
-            return on_run_screen(sequence, accession, model_path, ligand_map_path)
+            return on_run_screen(
+                sequence, accession, protein_name, model_path, ligand_map_path
+            )
 
         protein_picker.change(
             fn=on_protein_change,
             inputs=[protein_picker],
-            outputs=[accession_state, sequence_state],
+            outputs=[accession_state, sequence_state, protein_name_state],
         )
         run_btn.click(
             fn=begin_screen_ui,
@@ -794,7 +849,7 @@ Run AI-based virtual screening on the Sytravon and Genesis ligand libraries.
             outputs=[gallery, download_btn, status],
         ).then(
             fn=_run,
-            inputs=[sequence_state, accession_state],
+            inputs=[sequence_state, accession_state, protein_name_state],
             outputs=[gallery, download_btn, status],
         )
 
