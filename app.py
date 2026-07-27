@@ -83,16 +83,16 @@ _PROTEIN_PICKER_CSS = """
 .chip {
     display: none;
     align-items: center;
-    gap: 0.35rem;
+    gap: 0.4rem;
     max-width: 100%;
     box-sizing: border-box;
-    padding: 0.35rem 0.35rem 0.35rem 0.7rem;
+    padding: 0.45rem 0.4rem 0.45rem 0.85rem;
     border: 1px solid var(--border-color-primary, #c0c0c0);
     border-radius: 999px;
     background: var(--background-fill-secondary, #eef2ff);
     color: inherit;
     font: inherit;
-    font-size: 0.95rem;
+    font-size: 1.05rem;
     outline: none;
     cursor: default;
     user-select: text;
@@ -119,14 +119,14 @@ _PROTEIN_PICKER_CSS = """
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 1.5rem;
-    height: 1.5rem;
+    width: 1.65rem;
+    height: 1.65rem;
     border: none;
     border-radius: 999px;
     background: transparent;
     color: inherit;
     font: inherit;
-    font-size: 1.15rem;
+    font-size: 1.25rem;
     line-height: 1;
     cursor: pointer;
 }
@@ -676,7 +676,7 @@ html, body, .gradio-container,
 }
 .gradio-container {
     --demo-section-gap: 1rem;
-    --demo-section-gap-sm: 0.5rem;
+    --demo-section-gap-sm: 0.75rem;
 }
 .gradio-container .gap {
     gap: var(--demo-section-gap) !important;
