@@ -572,13 +572,13 @@ def _format_bytes(n_bytes: int) -> str:
     return f"{n_bytes} B"
 
 
-def begin_screen_ui() -> tuple[Any, Any, str]:
+def begin_screen_ui() -> tuple[Any, Any, Any, str]:
     """Reveal results UI immediately when a screen is started.
 
     Returns:
-        Tuple of ``(gallery_update, download_button_update, status)`` with the
-        gallery and download button visible, download disabled, and status cleared
-        until screening finishes.
+        Tuple of ``(gallery_update, download_button_update, divider_update,
+        status)`` with the gallery and download button visible, download
+        disabled, divider hidden, and status cleared until screening finishes.
     """
     return (
         gr.update(visible=True, value=None),
@@ -588,6 +588,7 @@ def begin_screen_ui() -> tuple[Any, Any, str]:
             value=None,
             label="Download Full Results",
         ),
+        gr.update(visible=False),
         "",
     )
 
@@ -598,7 +599,7 @@ def on_run_screen(
     protein_name: str,
     model_path: str,
     ligand_map_path: str,
-) -> tuple[Any, Any, str]:
+) -> tuple[Any, Any, Any, str]:
     """Screen the selected protein against Sytravon + Genesis.
 
     Args:
@@ -609,7 +610,8 @@ def on_run_screen(
         ligand_map_path: Ligand ID map path.
 
     Returns:
-        Tuple of ``(gallery_update, download_button_update, status)``.
+        Tuple of ``(gallery_update, download_button_update, divider_update,
+        status)``.
     """
     hidden_download = gr.update(
         value=None,
@@ -617,16 +619,27 @@ def on_run_screen(
         interactive=False,
         visible=False,
     )
+    hidden_divider = gr.update(visible=False)
     seq = str(sequence or "").strip()
     if not seq:
-        return gr.update(value=None, visible=False), hidden_download, "No protein selected."
+        return (
+            gr.update(value=None, visible=False),
+            hidden_download,
+            hidden_divider,
+            "No protein selected.",
+        )
 
     try:
         screen = _get_screen(model_path, ligand_map_path)
         results = screen.screen(seq)
         hits = screen.top_hits(results, k=10)
     except Exception as exc:  # noqa: BLE001
-        return gr.update(value=None, visible=False), hidden_download, f"Error: {exc}"
+        return (
+            gr.update(value=None, visible=False),
+            hidden_download,
+            hidden_divider,
+            f"Error: {exc}",
+        )
 
     gallery: list[tuple[Any, str]] = []
     for hit in hits:
@@ -656,7 +669,12 @@ def on_run_screen(
         f"Screened {len(results):,} ligands from Sytravon and Genesis libraries.\n\n"
         f"# Top {name} hits:"
     )
-    return gr.update(value=gallery, visible=True), download_update, status
+    return (
+        gr.update(value=gallery, visible=True),
+        download_update,
+        gr.update(visible=True),
+        status,
+    )
 
 
 _APP_CSS = """
@@ -665,6 +683,42 @@ html, body, .gradio-container,
 .gradio-container textarea, .gradio-container label,
 .gradio-container .prose, .gradio-container markdown {
     font-family: "Sinhala Sangam MN", Georgia, serif !important;
+}
+.gradio-container {
+    --demo-section-gap: 1rem;
+    --demo-section-gap-sm: 0.5rem;
+}
+.gradio-container .gap {
+    gap: var(--demo-section-gap) !important;
+}
+#demo-title .prose h1,
+#demo-title h1 {
+    margin: 0 !important;
+}
+#protein-picker,
+#run-screen-btn,
+#results-divider,
+#screen-status {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+}
+#results-divider hr.demo-results-rule {
+    margin: 0 !important;
+    border: none;
+    border-top: 1px solid var(--border-color-primary, #e5e7eb);
+}
+#screen-status p {
+    margin: 0 0 var(--demo-section-gap-sm) 0 !important;
+}
+#screen-status h1 {
+    margin: 0 !important;
+}
+#screen-status,
+#screen-status .prose,
+#screen-status > div {
+    overflow: visible !important;
+    max-height: none !important;
+    height: auto !important;
 }
 /* Full-width prominent CSV download button. */
 #download-full-results button {
@@ -789,7 +843,8 @@ def build_app(model_path: str, ligand_map_path: str) -> gr.Blocks:
         gr.Markdown(
             """
 # GPCR Predictor Demo
-            """.strip()
+            """.strip(),
+            elem_id="demo-title",
         )
 
         accession_state = gr.State("")
@@ -808,8 +863,15 @@ def build_app(model_path: str, ligand_map_path: str) -> gr.Blocks:
             container=False,
         )
 
-        run_btn = gr.Button("Run virtual screen", variant="primary")
-        status = gr.Markdown("")
+        run_btn = gr.Button(
+            "Run virtual screen", variant="primary", elem_id="run-screen-btn"
+        )
+        results_divider = gr.HTML(
+            '<hr class="demo-results-rule" />',
+            elem_id="results-divider",
+            visible=False,
+        )
+        status = gr.Markdown("", elem_id="screen-status")
 
         gallery = gr.Gallery(
             label="Top 10 hits",
@@ -833,7 +895,7 @@ def build_app(model_path: str, ligand_map_path: str) -> gr.Blocks:
 
         def _run(
             sequence: str, accession: str, protein_name: str
-        ) -> tuple[Any, Any, str]:
+        ) -> tuple[Any, Any, Any, str]:
             """Run screening with the app's fixed model and ligand map paths.
 
             Args:
@@ -842,7 +904,8 @@ def build_app(model_path: str, ligand_map_path: str) -> gr.Blocks:
                 protein_name: Short display name for the results title.
 
             Returns:
-                Tuple of ``(gallery_update, download_button_update, status)``.
+                Tuple of ``(gallery_update, download_button_update,
+                divider_update, status)``.
             """
             return on_run_screen(
                 sequence, accession, protein_name, model_path, ligand_map_path
@@ -856,11 +919,11 @@ def build_app(model_path: str, ligand_map_path: str) -> gr.Blocks:
         run_btn.click(
             fn=begin_screen_ui,
             inputs=None,
-            outputs=[gallery, download_btn, status],
+            outputs=[gallery, download_btn, results_divider, status],
         ).then(
             fn=_run,
             inputs=[sequence_state, accession_state, protein_name_state],
-            outputs=[gallery, download_btn, status],
+            outputs=[gallery, download_btn, results_divider, status],
         )
 
     return demo
