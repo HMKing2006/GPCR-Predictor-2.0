@@ -56,7 +56,7 @@ _PROTEIN_PICKER_CSS = """
 }
 .picker-label {
     font-size: var(--block-title-text-size, 1rem);
-    font-weight: var(--block-title-text-weight, 600);
+    font-weight: 400;
     margin-bottom: 0.4rem;
     color: var(--body-text-color, inherit);
 }
@@ -653,7 +653,7 @@ def on_run_screen(
     )
     name = str(protein_name or accession or "protein").strip() or "protein"
     status = (
-        f"Screened {len(results):,} ligands.\n\n"
+        f"Screened {len(results):,} ligands from Sytravon and Genesis libraries.\n\n"
         f"# Top {name} hits:"
     )
     return gr.update(value=gallery, visible=True), download_update, status
@@ -758,7 +758,19 @@ html, body, .gradio-container,
     opacity: 1 !important;
 }
 #protein-picker {
-    margin-bottom: 0.5rem;
+    margin: 0 0 0.5rem 0 !important;
+    padding: 0 !important;
+    width: 100% !important;
+}
+#protein-picker.block,
+#protein-picker .wrap,
+#protein-picker > div {
+    margin: 0 !important;
+    padding: 0 !important;
+    width: 100% !important;
+}
+#protein-picker .picker-label {
+    font-weight: 400 !important;
 }
 """
 
@@ -773,12 +785,10 @@ def build_app(model_path: str, ligand_map_path: str) -> gr.Blocks:
     Returns:
         A Gradio ``Blocks`` app.
     """
-    with gr.Blocks(title="GPCR Library Screen") as demo:
+    with gr.Blocks(title="GPCR Library Screen", fill_width=True) as demo:
         gr.Markdown(
             """
 # GPCR Predictor Demo
-
-Run AI-based virtual screening on the Sytravon and Genesis ligand libraries.
             """.strip()
         )
 
