@@ -572,13 +572,13 @@ def _format_bytes(n_bytes: int) -> str:
     return f"{n_bytes} B"
 
 
-def begin_screen_ui() -> tuple[Any, Any, Any, str]:
+def begin_screen_ui() -> tuple[Any, Any, str]:
     """Reveal results UI immediately when a screen is started.
 
     Returns:
-        Tuple of ``(gallery_update, download_button_update, divider_update,
-        status)`` with the gallery and download button visible, download
-        disabled, divider hidden, and status cleared until screening finishes.
+        Tuple of ``(gallery_update, download_button_update, status)`` with the
+        gallery and download button visible, download disabled, and status
+        cleared until screening finishes.
     """
     return (
         gr.update(visible=True, value=None),
@@ -588,7 +588,6 @@ def begin_screen_ui() -> tuple[Any, Any, Any, str]:
             value=None,
             label="Download Full Results",
         ),
-        gr.update(visible=False),
         "",
     )
 
@@ -599,7 +598,7 @@ def on_run_screen(
     protein_name: str,
     model_path: str,
     ligand_map_path: str,
-) -> tuple[Any, Any, Any, str]:
+) -> tuple[Any, Any, str]:
     """Screen the selected protein against Sytravon + Genesis.
 
     Args:
@@ -610,8 +609,7 @@ def on_run_screen(
         ligand_map_path: Ligand ID map path.
 
     Returns:
-        Tuple of ``(gallery_update, download_button_update, divider_update,
-        status)``.
+        Tuple of ``(gallery_update, download_button_update, status)``.
     """
     hidden_download = gr.update(
         value=None,
@@ -619,13 +617,11 @@ def on_run_screen(
         interactive=False,
         visible=False,
     )
-    hidden_divider = gr.update(visible=False)
     seq = str(sequence or "").strip()
     if not seq:
         return (
             gr.update(value=None, visible=False),
             hidden_download,
-            hidden_divider,
             "No protein selected.",
         )
 
@@ -637,7 +633,6 @@ def on_run_screen(
         return (
             gr.update(value=None, visible=False),
             hidden_download,
-            hidden_divider,
             f"Error: {exc}",
         )
 
@@ -669,12 +664,7 @@ def on_run_screen(
         f"Screened {len(results):,} ligands from Sytravon and Genesis libraries.\n\n"
         f"# Top {name} hits:"
     )
-    return (
-        gr.update(value=gallery, visible=True),
-        download_update,
-        gr.update(visible=True),
-        status,
-    )
+    return gr.update(value=gallery, visible=True), download_update, status
 
 
 _APP_CSS = """
@@ -695,6 +685,11 @@ html, body, .gradio-container,
 #demo-title h1 {
     margin: 0 !important;
 }
+/* Match title→protein gap to Screened→Top hits (half section gap). */
+#demo-title {
+    margin-bottom: calc(var(--demo-section-gap-sm) - var(--demo-section-gap)) !important;
+    padding-bottom: 0 !important;
+}
 #protein-picker,
 #run-screen-btn,
 #results-divider,
@@ -702,7 +697,21 @@ html, body, .gradio-container,
     margin-top: 0 !important;
     margin-bottom: 0 !important;
 }
+#results-divider,
+#results-divider > div,
+#results-divider .wrap {
+    width: 100% !important;
+    max-width: 100% !important;
+    padding: 0 !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+    box-sizing: border-box !important;
+}
 #results-divider hr.demo-results-rule {
+    display: block !important;
+    width: 100% !important;
+    max-width: none !important;
+    box-sizing: border-box !important;
     margin: 0 !important;
     border: none;
     border-top: 1px solid var(--border-color-primary, #e5e7eb);
@@ -869,7 +878,9 @@ def build_app(model_path: str, ligand_map_path: str) -> gr.Blocks:
         results_divider = gr.HTML(
             '<hr class="demo-results-rule" />',
             elem_id="results-divider",
-            visible=False,
+            visible=True,
+            padding=False,
+            container=False,
         )
         status = gr.Markdown("", elem_id="screen-status")
 
@@ -895,7 +906,7 @@ def build_app(model_path: str, ligand_map_path: str) -> gr.Blocks:
 
         def _run(
             sequence: str, accession: str, protein_name: str
-        ) -> tuple[Any, Any, Any, str]:
+        ) -> tuple[Any, Any, str]:
             """Run screening with the app's fixed model and ligand map paths.
 
             Args:
@@ -904,8 +915,7 @@ def build_app(model_path: str, ligand_map_path: str) -> gr.Blocks:
                 protein_name: Short display name for the results title.
 
             Returns:
-                Tuple of ``(gallery_update, download_button_update,
-                divider_update, status)``.
+                Tuple of ``(gallery_update, download_button_update, status)``.
             """
             return on_run_screen(
                 sequence, accession, protein_name, model_path, ligand_map_path
@@ -919,11 +929,11 @@ def build_app(model_path: str, ligand_map_path: str) -> gr.Blocks:
         run_btn.click(
             fn=begin_screen_ui,
             inputs=None,
-            outputs=[gallery, download_btn, results_divider, status],
+            outputs=[gallery, download_btn, status],
         ).then(
             fn=_run,
             inputs=[sequence_state, accession_state, protein_name_state],
-            outputs=[gallery, download_btn, results_divider, status],
+            outputs=[gallery, download_btn, status],
         )
 
     return demo
