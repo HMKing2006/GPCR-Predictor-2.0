@@ -634,7 +634,7 @@ def on_run_screen(
         if hit.image is not None:
             gallery.append((hit.image, caption))
         else:
-            blank = Image.new("RGB", (320, 240), color=(255, 255, 255))
+            blank = Image.new("RGB", (640, 480), color=(255, 255, 255))
             gallery.append((blank, caption))
 
     csv_bytes = ScreenLibrary.results_to_csv_bytes(results)

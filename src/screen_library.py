@@ -292,7 +292,7 @@ class ScreenLibrary:
         return buf.getvalue().encode("utf-8")
 
 
-def depict_smiles(smiles: str, size: tuple[int, int] = (320, 240)) -> Optional[Image.Image]:
+def depict_smiles(smiles: str, size: tuple[int, int] = (640, 480)) -> Optional[Image.Image]:
     """Draw a 2D depiction of a SMILES string.
 
     Args:
