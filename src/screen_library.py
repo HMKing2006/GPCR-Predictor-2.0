@@ -30,9 +30,7 @@ from src.featurize import assemble_matrix
 DEFAULT_LIGAND_MAP: str = os.path.join(
     config.DATA_DIR, "screen", "ligand_id_map.tsv"
 )
-DEFAULT_MODEL: str = os.path.join(
-    config.MODELS_DIR, "mlp_512x2_time_morgan_descriptors.joblib"
-)
+DEFAULT_MODEL: str = config.DEFAULT_PAIR_MODEL_PATH
 DEFAULT_ASSAY: str = "Ki"
 DEFAULT_PH: float = float(config.DEFAULT_PH)
 DEFAULT_TEMP: float = float(config.DEFAULT_TEMP_C)

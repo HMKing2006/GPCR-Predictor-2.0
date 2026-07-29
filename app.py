@@ -572,6 +572,22 @@ def _format_bytes(n_bytes: int) -> str:
     return f"{n_bytes} B"
 
 
+def _results_csv_basename(protein_name: str, accession: str) -> str:
+    """Build a download filename like ``TSHR_predictions.csv``.
+
+    Args:
+        protein_name: Gene / display name (preferred stem).
+        accession: UniProt accession fallback when no gene name is set.
+
+    Returns:
+        A filesystem-safe ``{name}_predictions.csv`` basename.
+    """
+    raw = str(protein_name or accession or "protein").strip() or "protein"
+    safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in raw)
+    safe = safe.strip("_") or "protein"
+    return f"{safe}_predictions.csv"
+
+
 def begin_screen_ui() -> tuple[Any, Any, str]:
     """Reveal results UI immediately when a screen is started.
 
@@ -646,9 +662,8 @@ def on_run_screen(
             gallery.append((blank, caption))
 
     csv_bytes = ScreenLibrary.results_to_csv_bytes(results)
-    acc = str(accession or "protein").strip().upper() or "protein"
-    fd, csv_path = tempfile.mkstemp(prefix=f"screen_{acc}_", suffix=".csv")
-    os.close(fd)
+    name = str(protein_name or accession or "protein").strip() or "protein"
+    csv_path = os.path.join(tempfile.mkdtemp(), _results_csv_basename(name, accession))
     with open(csv_path, "wb") as handle:
         handle.write(csv_bytes)
 
@@ -659,7 +674,6 @@ def on_run_screen(
         interactive=True,
         visible=True,
     )
-    name = str(protein_name or accession or "protein").strip() or "protein"
     status = (
         f"Screened {len(results):,} ligands from Sytravon and Genesis libraries.\n\n"
         f"# Top {name} hits:"

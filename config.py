@@ -15,18 +15,23 @@ from typing import Any, Final
 
 PROJECT_ROOT: Final[str] = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR: Final[str] = os.path.join(PROJECT_ROOT, "data")
-TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "BindingDB_all_prepared.csv")
 PAPYRUS_PP_TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "Papyrus_pp_prepared.parquet")
 PAPYRUS_FULL_TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "Papyrus_full_prepared.parquet")
 PAPYRUS_FULL_BINARY_TRAIN_CSV: Final[str] = os.path.join(
     DATA_DIR, "train", "Papyrus_full_binary_prepared.parquet"
 )
+# Default pair-model training table (matches the screening GUI checkpoint).
+TRAIN_CSV: Final[str] = PAPYRUS_FULL_BINARY_TRAIN_CSV
 GPCRDB_TRAIN_CSV: Final[str] = os.path.join(DATA_DIR, "train", "GPCRdb_prepared.parquet")
 GPCRDB_RAW_CSV: Final[str] = os.path.join(DATA_DIR, "train", "gpcrdb_data.csv")
 CACHE_DIR: Final[str] = os.path.join(PROJECT_ROOT, "cache")
 # Legacy flat cache paths retained for callers of low-level split helpers.
 SPLITS_DIR: Final[str] = os.path.join(DATA_DIR, "splits")
 MODELS_DIR: Final[str] = os.path.join(PROJECT_ROOT, "models")
+# Default pair binder used by ``train.py`` (save path) and ``app.py`` (load path).
+DEFAULT_PAIR_MODEL_PATH: Final[str] = os.path.join(
+    MODELS_DIR, "mlp_512x2_time_morgan_descriptors.joblib"
+)
 FEATURES_DIR: Final[str] = os.path.join(CACHE_DIR, "features")
 DATASETS_CACHE_DIR: Final[str] = os.path.join(CACHE_DIR, "datasets")
 
@@ -124,7 +129,7 @@ ACTIVITY_THRESHOLD_NM: Final[float] = 10000.0
 
 # --- Default hyperparameters -------------------------------------------------
 
-DEFAULT_MODEL_TYPE: Final[str] = "rf"
+DEFAULT_MODEL_TYPE: Final[str] = "mlp"
 RANDOM_SEED: Final[int] = 42
 TEST_FRACTION: Final[float] = 0.20
 GRID_VAL_FRACTION: Final[float] = 0.10
@@ -134,7 +139,7 @@ GRID_TEST_FRACTION: Final[float] = 0.10
 # ``protein`` = cold-protein; ``double-cold`` = protein+scaffold; ``time`` =
 # publication-year. When the two flags differ, test is carved first and val is
 # carved from the remainder.
-DEFAULT_TEST_SPLIT: Final[str] = "protein"
+DEFAULT_TEST_SPLIT: Final[str] = "time"
 DEFAULT_VALIDATION_SPLIT: Final[str] = "protein"
 
 # Random-forest defaults (warm-start incremental training).
@@ -157,13 +162,14 @@ RF_DEFAULTS: Final[dict[str, int]] = {
 # ``patience`` to ``0`` to disable early stopping and always run ``epochs``.
 # ``class_weights`` sets BCE ``pos_weight`` to ``n_neg / n_pos`` on the fit
 # rows (inverse class frequency) to counter sparse actives; disable for plain BCE.
+# Default is off to match the screening GUI checkpoint.
 # ``use_batchnorm`` inserts BatchNorm1d after each hidden linear layer.
 # ``use_bilinear`` adds a learned protein/ligand bilinear interaction block: the
 # protein and ligand embeddings are projected to ``bilinear_dim`` and combined by
 # ``nn.Bilinear`` before being concatenated back into the MLP trunk.
 MLP_DEFAULTS: Final[dict[str, Any]] = {
-    "hidden_dim": 1024,
-    "num_layers": 3,
+    "hidden_dim": 512,
+    "num_layers": 2,
     "dropout": 0.1,
     "batch_size": 512,
     "epochs": 20,
@@ -172,7 +178,7 @@ MLP_DEFAULTS: Final[dict[str, Any]] = {
     "patience": 4,
     "es_val_fraction": 0.05,
     "es_min_delta": 1e-4,
-    "class_weights": True,
+    "class_weights": False,
     "use_batchnorm": False,
     "use_bilinear": False,
     "bilinear_dim": 256,

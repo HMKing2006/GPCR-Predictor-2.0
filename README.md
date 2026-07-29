@@ -2,11 +2,12 @@
 
 Predicts whether a protein–ligand pair is an active binder (activity ≤ 50 nM) from
 BindingDB or Papyrus data. Ligands default to Morgan fingerprints + RDKit
-descriptors (MoLFormer-XL and other reps are available via ``--ligand-model``).
+descriptors (MoLFormer-XL and other reps are available via `--ligand-model`).
 Proteins are embedded with ESM-2. Ligand and protein vectors are cached
 in LMDB stores named after the components that produced them. Outer folds use
-independent ``--test-split`` / ``--validation-split`` strategies (both default to
-**cold-protein**); test is carved first, then validation from the remainder.
+independent `--test-split` / `--validation-split` strategies (defaults:
+**time** test, **cold-protein** validation); test is carved first, then
+validation from the remainder.
 Evaluation reports AUROC/AUPRC plus known/unknown protein and scaffold breakouts.
 By default the feature vector is protein + ligand only (assay type, pH, and
 temperature are optional).
@@ -22,13 +23,15 @@ Hub on first use:
 
 - Protein: `facebook/esm2_t33_650M_UR50D` (1280-d)
 - Ligand (default): Morgan (2048-d) + RDKit descriptors (217-d). Optional HF ligand
-  model: `ibm-research/MoLFormer-XL-both-10pct` (768-d, `trust_remote_code=True`)
-  via `--ligand-model molformer`.
+model: `ibm-research/MoLFormer-XL-both-10pct` (768-d, `trust_remote_code=True`)
+via `--ligand-model molformer`.
 
 [Papyrus](https://doi.org/10.1186/s13321-022-00672-x) support requires
 `papyrus-scripts` and `pyarrow` (both in `requirements.txt`).
 
 ## Data sources
+
+
 
 ### BindingDB (default)
 
@@ -37,13 +40,13 @@ preparation:
 
 - Salts are stripped and SMILES canonicalized (RDKit largest-fragment).
 - Activity values (IC50, EC50, Ki, Kd, in nM) are converted to
-  `pActivity = -log10(value_nM * 1e-9)`.
+`pActivity = -log10(value_nM * 1e-9)`.
 - Rows with multiple assay values are exploded into one example per assay type.
 - Censored values (`>` / `<`) and rows with missing SMILES/sequence/activity are
-  dropped.
+dropped.
 - `pH` (missing imputed to 7.4) and `Temp (C)` (parsed, clipped, missing imputed
-  to 25.0 C) are available as optional scalar features when
-  `--include-assay-context` is set. Assay type is one-hot encoded in that mode.
+to 25.0 C) are available as optional scalar features when
+`--include-assay-context` is set. Assay type is one-hot encoded in that mode.
 
 Labels are stored as binder / non-binder (50 nM cutoff,
 `config.ACTIVITY_THRESHOLD_NM`) when features are built. Rows with an optional
@@ -105,15 +108,17 @@ python build_papyrus.py --subset full --include-binary --limit 3000000 --no-down
 
 Useful flags:
 
-| Flag | Purpose |
-|---|---|
-| `--include-binary` | Append Papyrus `Activity_class` rows (`--subset full` only) |
-| `--no-download` | Skip download; assume Papyrus data is already present |
-| `--disk-margin 0` | Relax papyrus-scripts free-disk check (default) |
-| `--chunk-size 500000` | Rows per streaming chunk |
-| `--output PATH` | Override output Parquet path |
-| `--limit N` | Cap total output rows (quant written before binary) |
-| `--resume` | Resume the binary pass from an existing valid prepared Parquet |
+
+| Flag                  | Purpose                                                        |
+| --------------------- | -------------------------------------------------------------- |
+| `--include-binary`    | Append Papyrus `Activity_class` rows (`--subset full` only)    |
+| `--no-download`       | Skip download; assume Papyrus data is already present          |
+| `--disk-margin 0`     | Relax papyrus-scripts free-disk check (default)                |
+| `--chunk-size 500000` | Rows per streaming chunk                                       |
+| `--output PATH`       | Override output Parquet path                                   |
+| `--limit N`           | Cap total output rows (quant written before binary)            |
+| `--resume`            | Resume the binary pass from an existing valid prepared Parquet |
+
 
 Train or grid-search on Papyrus by passing `--data` (CSV or Parquet prepared
 paths). Use `--rebuild-features` after changing row-level settings such as the
@@ -169,18 +174,22 @@ python -c "import pyarrow.parquet as pq; pq.write_table(
 python train.py --data data/train/Papyrus_GPCRdb_prepared.parquet --rebuild-features
 ```
 
+
+
 ## Ligand representations
 
 `--ligand-model` accepts a Hugging Face SMILES transformer id, a reserved RDKit
 token, or a **comma-separated combination** (concatenated in that order):
 
-| Token | Features |
-|---|---|
-| `morgan` | Morgan/ECFP fingerprint (radius 2, 2048 bits) |
-| `avalon` | Avalon fingerprint (512 bits) |
-| `descriptors` | Full RDKit `Descriptors.descList` (~217 physicochemical features) |
-| `molformer` | Alias for `ibm-research/MoLFormer-XL-both-10pct` (768-d) |
-| any HF model id | Mean-pooled SMILES transformer embedding |
+
+| Token           | Features                                                          |
+| --------------- | ----------------------------------------------------------------- |
+| `morgan`        | Morgan/ECFP fingerprint (radius 2, 2048 bits)                     |
+| `avalon`        | Avalon fingerprint (512 bits)                                     |
+| `descriptors`   | Full RDKit `Descriptors.descList` (~217 physicochemical features) |
+| `molformer`     | Alias for `ibm-research/MoLFormer-XL-both-10pct` (768-d)          |
+| any HF model id | Mean-pooled SMILES transformer embedding                          |
+
 
 Examples:
 
@@ -245,7 +254,7 @@ successful rebuild, obsolete `cache/features/`, `data/splits/`, `X.dat`, and
 
 `concat(protein_emb, ligand_repr)`
 
-**With `--include-assay-context`:**
+**With** `--include-assay-context`**:**
 
 `concat(protein_emb, ligand_repr, assay_onehot[5], pH[1], temp[1])`
 
@@ -263,13 +272,15 @@ per-row orphan id so they never merge incorrectly.
 ## Splits
 
 Outer train/val/test folds are controlled by two flags (both default to
-``protein`` = cold-protein):
+`protein` = cold-protein):
 
-| Strategy | Meaning |
-|----------|---------|
-| `protein` | Train/val/test share no proteins |
-| `double-cold` | Share neither proteins nor Murcko scaffolds |
-| `time` | Publication-year cutoffs from `--val-fraction` / `--test-fraction` (missing years → train) |
+
+| Strategy      | Meaning                                                                                    |
+| ------------- | ------------------------------------------------------------------------------------------ |
+| `protein`     | Train/val/test share no proteins                                                           |
+| `double-cold` | Share neither proteins nor Murcko scaffolds                                                |
+| `time`        | Publication-year cutoffs from `--val-fraction` / `--test-fraction` (missing years → train) |
+
 
 **Composition:** test is always carved with `--test-split` first; when a
 validation fold is used, `--validation-split` carves val from the remainder.
@@ -296,7 +307,8 @@ rebuild that writes `years.npy`.
 ## Training
 
 ```bash
-# Default: BindingDB, random forest, cold-protein test, protein+ligand only
+# Default: Papyrus full binary, MLP 512×2 (morgan+descriptors), time test fold;
+# writes models/mlp_512x2_time_morgan_descriptors.joblib (same path the GUI loads)
 python train.py
 
 # Include assay type / pH / temperature features
@@ -305,15 +317,14 @@ python train.py --include-assay-context --rebuild-features
 # Papyrus++
 python train.py --data data/train/Papyrus_pp_prepared.parquet --rebuild-features
 
-# Temporal test fold (Papyrus with Year); val merged into train in train.py
-python train.py --data data/train/Papyrus_pp_prepared.parquet \
-  --test-split time --rebuild-features
+# Cold-protein test fold instead of time
+python train.py --test-split protein --rebuild-features
 
 # MLP with custom hyperparameters
-python train.py --model mlp --epochs 30 --hidden-dim 2048 --learning-rate 5e-4
+python train.py --epochs 30 --hidden-dim 2048 --learning-rate 5e-4
 
-# MLP without inverse-frequency BCE class weights (on by default)
-python train.py --model mlp --no-class-weights
+# MLP with inverse-frequency BCE class weights (off by default)
+python train.py --class-weights
 
 # Random forest memory/accuracy tuning
 python train.py --model rf --n-estimators 400 --rf-batch-trees 25 --rf-shard-rows 50000
@@ -325,8 +336,7 @@ python train.py --limit 5000
 After training, accuracy, precision, recall, F1, AUROC, and AUPRC are printed,
 followed by **novelty breakouts** on the test set (known/unknown protein,
 known/unknown scaffold, and the 2×2 cells relative to train). The model is
-saved to `models/` as a joblib file. Splits are saved under the matching
-`cache/datasets/<stem>/splits/` directory and reused only when their embedded
+saved to `models/` as a joblib file. Splits are saved under the matching `cache/datasets/<stem>/splits/` directory and reused only when their embedded
 row-layout signature and seed match.
 
 MLP early stopping carves a holdout from the **training** split (~5% of train
@@ -435,20 +445,18 @@ to remove the stack.
 
 Defaults:
 
-- **Family / target vocab:** labels need ≥``--min-positives`` unique active
-  ligands (default **100**); targets are further capped at top 1024 by count
+- **Family / target vocab:** labels need ≥`--min-positives` unique active
+ligands (default **100**); targets are further capped at top 1024 by count
 - **Positives:** same binder rule as pair training; negatives are implicit zeros
 - **Class balance:** `--class-weights` (default on) sets per-label BCE
-  ``pos_weight = n_neg/n_pos``. Optional ``--active-fraction f`` builds a
-  **fixed per-label train mask** that downsamples negatives so positives are
-  ~``f`` of supervised cells (e.g. ``0.3``). Mask is train-loss only;
-  early-stop and outer-fold metrics use the full multi-hot matrix. When both
-  flags are on, ``pos_weight`` is recomputed on the masked counts.
-- **Splits:** nested ``--test-split`` / ``--validation-split`` with
-  ``scaffold`` (Murcko-cold, default) or ``time`` (percentage year cutoffs);
-  test is carved first, then val from the remainder (merged into train by
-  ``train_multilabel``; kept for selection by ``grid_search_multilabel``).
-  Per-ligand year is the **max** among its active annotations (undated → train)
+`pos_weight = n_neg/n_pos`. Optional `--active-fraction f` builds a
+**fixed per-label train mask** that downsamples negatives so positives are
+~``f`of supervised cells (e.g.`0.3`). Mask is train-loss only; early-stop and outer-fold metrics use the full multi-hot matrix. When both flags are on,` pos_weight`` is recomputed on the masked counts.
+- **Splits:** nested `--test-split` / `--validation-split` with
+`scaffold` (Murcko-cold, default) or `time` (percentage year cutoffs);
+test is carved first, then val from the remainder (merged into train by
+`train_multilabel`; kept for selection by `grid_search_multilabel`).
+Per-ligand year is the **max** among its active annotations (undated → train)
 
 ```bash
 # Build prepared ligand tables + vocab sidecars from pair prepared Parquet
@@ -477,6 +485,8 @@ python predict_multilabel.py --model models/multilabel/family_multilabel__test-s
   --ligand "CCO" --top-k 10 --output family_preds.csv
 ```
 
+
+
 ### GPCRdb multilabel
 
 Requires `data/train/GPCRdb_prepared.parquet` first (`build_gpcrdb.py`).
@@ -498,6 +508,8 @@ python train_multilabel.py --task family \
   --data data/train/GPCRdb_Ligand_family_prepared.parquet \
   --vocab data/train/GPCRdb_family_vocab.json --rebuild-features
 ```
+
+
 
 ## Project layout
 
@@ -531,3 +543,4 @@ train_multilabel.py          Train family or target multilabel MLP.
 grid_search_multilabel.py    Grid-search multilabel MLPs (val micro-AUPRC).
 predict_multilabel.py        Ligand → multilabel probability vector.
 ```
+

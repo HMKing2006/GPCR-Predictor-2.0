@@ -304,7 +304,7 @@ def run_training(args: argparse.Namespace) -> str:
     )
 
     os.makedirs(config.MODELS_DIR, exist_ok=True)
-    output = args.output or os.path.join(config.MODELS_DIR, f"{args.model}_model.joblib")
+    output = args.output or config.DEFAULT_PAIR_MODEL_PATH
     model.save(output)
     print(f"\n[train] saved model to {output}")
     return output
@@ -365,7 +365,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--seed", type=int, default=config.RANDOM_SEED)
-    p.add_argument("--output", default=None, help="Output joblib path.")
+    p.add_argument(
+        "--output",
+        default=None,
+        help=f"Output joblib path (default: {config.DEFAULT_PAIR_MODEL_PATH}).",
+    )
     p.add_argument(
         "--rebuild-features",
         action="store_true",
@@ -427,8 +431,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=bool(config.MLP_DEFAULTS["class_weights"]),
         help=(
-            "Weight BCE positives by n_neg/n_pos on the fit rows (default: on). "
-            "Use --no-class-weights for unweighted BCE."
+            "Weight BCE positives by n_neg/n_pos on the fit rows "
+            f"(default: {'on' if config.MLP_DEFAULTS['class_weights'] else 'off'}). "
+            "Use --class-weights / --no-class-weights to override."
         ),
     )
     p.add_argument(
