@@ -1,13 +1,17 @@
-"""On-disk embedding cache backed by LMDB.
+"""On-disk LMDB caches for embeddings and Murcko scaffolds.
 
 Embeddings are expensive to compute, so protein and ligand vectors are persisted
 in LMDB stores. Each store's filename is derived from the model that produced
 its contents, so switching either embedding model transparently references (or
 creates) a different store and never mixes vectors from different models.
 
+Bemis-Murcko scaffolds are cached separately in ``scaffold__murcko.lmdb`` as
+UTF-8 strings keyed by SMILES.
+
 Keys are SHA-1 hashes of the entity string (protein sequence or canonical
-SMILES), keeping key sizes bounded regardless of sequence/SMILES length. Values
-are raw ``float32`` bytes decoded with :func:`numpy.frombuffer`.
+SMILES), keeping key sizes bounded regardless of sequence/SMILES length.
+Embedding values are raw ``float32`` bytes decoded with
+:func:`numpy.frombuffer`.
 """
 
 from __future__ import annotations
@@ -24,6 +28,10 @@ import config
 
 # 64 GiB sparse map; LMDB only consumes actual written pages on most systems.
 _DEFAULT_MAP_SIZE: int = 64 * 1024**3
+# Murcko scaffolds are short strings; a 1 GiB map is ample headroom.
+_SCAFFOLD_MAP_SIZE: int = 1 * 1024**3
+SCAFFOLD_CACHE_MODEL: str = "murcko"
+SCAFFOLD_ORPHAN_SENTINEL: str = "__orphan__"
 
 
 def sanitize_model_id(model_id: str) -> str:
@@ -43,8 +51,8 @@ def cache_path(modality: str, model_id: str, cache_dir: str = config.CACHE_DIR) 
     """Build the LMDB path for a modality/model pair.
 
     Args:
-        modality: Either ``"protein"`` or ``"ligand"``.
-        model_id: The embedding model identifier.
+        modality: ``"protein"``, ``"ligand"``, or ``"scaffold"``.
+        model_id: The embedding model identifier or scaffold cache id.
         cache_dir: Directory in which cache stores live.
 
     Returns:
@@ -260,6 +268,158 @@ class EmbeddingCache:
 
     def __len__(self) -> int:
         """Count the stored embeddings.
+
+        Returns:
+            The number of key/value entries in the store.
+        """
+        with self._env.begin(write=False) as txn:
+            return int(txn.stat()["entries"])
+
+
+class ScaffoldCache:
+    """A persistent store of Bemis-Murcko scaffold strings keyed by SMILES.
+
+    Values are UTF-8 scaffold SMILES, or :data:`SCAFFOLD_ORPHAN_SENTINEL` when
+    RDKit cannot derive a scaffold. Row-specific orphan keys are expanded at
+    index time so split semantics stay unchanged.
+    """
+
+    def __init__(
+        self,
+        cache_dir: str = config.CACHE_DIR,
+        map_size: int = _SCAFFOLD_MAP_SIZE,
+        readonly: bool = False,
+    ) -> None:
+        """Open (or create) the global Murcko scaffold LMDB store.
+
+        Args:
+            cache_dir: Directory in which cache stores live.
+            map_size: Maximum size in bytes the store may grow to.
+            readonly: If ``True``, open without write access (and without
+                creating the store when it is missing).
+        """
+        os.makedirs(cache_dir, exist_ok=True)
+        self.path: str = cache_path("scaffold", SCAFFOLD_CACHE_MODEL, cache_dir)
+        self._env: lmdb.Environment = lmdb.open(
+            self.path,
+            map_size=map_size,
+            subdir=True,
+            readonly=readonly,
+            lock=not readonly,
+            readahead=False,
+            meminit=False,
+            create=not readonly,
+        )
+
+    def __enter__(self) -> "ScaffoldCache":
+        """Enter the runtime context and return the cache instance.
+
+        Returns:
+            This :class:`ScaffoldCache`.
+        """
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        """Close the LMDB environment on context exit.
+
+        Args:
+            exc_type: Exception type if raised in the block, else ``None``.
+            exc: Exception instance if raised, else ``None``.
+            tb: Traceback if an exception was raised, else ``None``.
+        """
+        self.close()
+
+    def close(self) -> None:
+        """Close the underlying LMDB environment.
+
+        Returns:
+            None.
+        """
+        self._env.close()
+
+    def contains(self, smiles: str) -> bool:
+        """Report whether a SMILES already has a cached scaffold value.
+
+        Args:
+            smiles: Canonical ligand SMILES.
+
+        Returns:
+            ``True`` if a value is stored for ``smiles``.
+        """
+        with self._env.begin(write=False) as txn:
+            return txn.get(_key(smiles)) is not None
+
+    def get(self, smiles: str) -> Optional[str]:
+        """Fetch a single cached scaffold value.
+
+        Args:
+            smiles: Canonical ligand SMILES.
+
+        Returns:
+            The stored scaffold string or orphan sentinel, or ``None`` on miss.
+        """
+        with self._env.begin(write=False) as txn:
+            raw = txn.get(_key(smiles))
+        if raw is None:
+            return None
+        return raw.decode("utf-8")
+
+    def get_many(self, smiles_list: Iterable[str]) -> dict[str, str]:
+        """Fetch several scaffold values in one read transaction.
+
+        Args:
+            smiles_list: Iterable of canonical ligand SMILES strings.
+
+        Returns:
+            Mapping from each present SMILES to its stored value.
+        """
+        result: dict[str, str] = {}
+        with self._env.begin(write=False) as txn:
+            for smiles in smiles_list:
+                raw = txn.get(_key(smiles))
+                if raw is not None:
+                    result[smiles] = raw.decode("utf-8")
+        return result
+
+    def missing(self, smiles_list: Iterable[str]) -> list[str]:
+        """Return SMILES strings that are not yet cached.
+
+        Args:
+            smiles_list: Iterable of canonical ligand SMILES (may contain
+                duplicates).
+
+        Returns:
+            De-duplicated, order-preserving list of SMILES with no stored value.
+        """
+        result: list[str] = []
+        already: set[str] = set()
+        with self._env.begin(write=False) as txn:
+            for smiles in smiles_list:
+                if smiles in already:
+                    continue
+                already.add(smiles)
+                if txn.get(_key(smiles)) is None:
+                    result.append(smiles)
+        return result
+
+    def put_many(self, scaffolds: dict[str, str]) -> None:
+        """Persist a batch of scaffold values in one write transaction.
+
+        Args:
+            scaffolds: Mapping from SMILES to scaffold SMILES or
+                :data:`SCAFFOLD_ORPHAN_SENTINEL`.
+
+        Returns:
+            None.
+        """
+        if not scaffolds:
+            return
+        with self._env.begin(write=True) as txn:
+            for smiles, scaffold in scaffolds.items():
+                txn.put(_key(smiles), scaffold.encode("utf-8"), overwrite=True)
+
+    def __len__(self) -> int:
+        """Count the stored scaffold entries.
 
         Returns:
             The number of key/value entries in the store.

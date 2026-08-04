@@ -14,37 +14,16 @@ from typing import Any, Iterator, Optional, Sequence
 
 import numpy as np
 import pyarrow.parquet as pq
-from rdkit import Chem
-from rdkit.Chem.Scaffolds import MurckoScaffold
 
 import config
+from src.featurize import MurckoScaffoldResolver
 from src.ligand_repr import CompositeLigandFeaturizer, canonical_ligand_repr, parse_ligand_repr
-from src.lmdb_cache import EmbeddingCache
+from src.lmdb_cache import EmbeddingCache, ScaffoldCache
 from src.multilabel import config as ml_config
 from src.multilabel.vocab import label_index, load_vocab
 
 _ROW_CHUNK: int = 50_000
 _PROGRESS_EVERY: int = 50_000
-
-
-def murcko_scaffold_key(smiles: str, row_index: int) -> str:
-    """Return a Bemis-Murcko scaffold key for a ligand SMILES.
-
-    Args:
-        smiles: Canonical ligand SMILES.
-        row_index: Zero-based row index used for the orphan fallback key.
-
-    Returns:
-        Scaffold SMILES, or a unique row key when scaffolding fails.
-    """
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return f"__orphan_{row_index}"
-    try:
-        scaffold = MurckoScaffold.MurckoScaffoldSmiles(mol=mol)
-    except Exception:
-        return f"__orphan_{row_index}"
-    return scaffold or f"__orphan_{row_index}"
 
 
 def _dataset_stem(source_path: str) -> str:
@@ -262,26 +241,29 @@ def _index_prepared_table(
     scaffold_ids: list[int] = []
     ligands: list[str] = []
 
-    for i, (smiles, label_list, year) in enumerate(zip(smiles_col, label_col, year_col)):
-        smiles_text = str(smiles or "").strip()
-        if not smiles_text:
-            raise ValueError(f"Empty Ligand SMILES at row {i} in {source_path}.")
-        ligands.append(smiles_text)
-        scaffold = murcko_scaffold_key(smiles_text, i)
-        scaffold_ids.append(scaffold_index.setdefault(scaffold, len(scaffold_index)))
-        if year is not None and str(year).strip() and str(year).lower() != "nan":
-            try:
-                years[i] = int(year)
-            except (TypeError, ValueError):
-                years[i] = -1
-        if label_list is None:
-            continue
-        for label in label_list:
-            col = index.get(str(label))
-            if col is not None:
-                labels[i, col] = 1
-        if verbose and (i + 1) % _PROGRESS_EVERY == 0:
-            print(f"[features] indexed {i + 1}/{n} ligands", flush=True)
+    with ScaffoldCache() as scaffold_cache:
+        resolver = MurckoScaffoldResolver(cache=scaffold_cache)
+        for i, (smiles, label_list, year) in enumerate(zip(smiles_col, label_col, year_col)):
+            smiles_text = str(smiles or "").strip()
+            if not smiles_text:
+                raise ValueError(f"Empty Ligand SMILES at row {i} in {source_path}.")
+            ligands.append(smiles_text)
+            scaffold = resolver.resolve(smiles_text, i)
+            scaffold_ids.append(scaffold_index.setdefault(scaffold, len(scaffold_index)))
+            if year is not None and str(year).strip() and str(year).lower() != "nan":
+                try:
+                    years[i] = int(year)
+                except (TypeError, ValueError):
+                    years[i] = -1
+            if label_list is None:
+                continue
+            for label in label_list:
+                col = index.get(str(label))
+                if col is not None:
+                    labels[i, col] = 1
+            if verbose and (i + 1) % _PROGRESS_EVERY == 0:
+                print(f"[features] indexed {i + 1}/{n} ligands", flush=True)
+        resolver.flush()
 
     return _IndexedLigands(
         ligands=ligands,

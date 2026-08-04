@@ -208,9 +208,12 @@ python train.py --ligand-model ibm-research/MoLFormer-XL-both-10pct
 ```
 
 Each component is cached independently under `cache/ligand__*.lmdb`, so adding
-MoLFormer to an existing Morgan cache reuses the Morgan store. Dataset-local
-matrices are also component-specific, so combined representations concatenate
-the selected matrices at runtime rather than storing another combined copy.
+MoLFormer to an existing Morgan cache reuses the Morgan store. Bemis-Murcko
+scaffolds are cached globally in `cache/scaffold__murcko.lmdb` (SMILES to
+scaffold string), so feature indexing skips repeated RDKit work across runs.
+Dataset-local matrices are also component-specific, so combined representations
+concatenate the selected matrices at runtime rather than storing another combined
+copy.
 
 ## Feature storage
 
@@ -326,6 +329,25 @@ python train.py --epochs 30 --hidden-dim 2048 --learning-rate 5e-4
 # MLP with inverse-frequency BCE class weights (off by default)
 python train.py --class-weights
 
+# Per-target balancing (MLP only; excludes single-class targets and prints counts)
+python train.py --target-balance weights --no-class-weights
+python train.py --target-balance downsample --no-class-weights
+python train.py --target-balance upsample --no-class-weights
+
+# Same modes, but drive every target toward the fit-set average active rate
+python train.py --target-balance downsample --target-balance-ratio dataset --no-class-weights
+python train.py --target-balance weights --target-balance-ratio dataset --no-class-weights
+
+# Mean-per-target BCE on stratified batches (equal weight per protein)
+python train.py --target-bce-reduction mean --no-class-weights
+
+# Combine class balancing with mean-target BCE and optional RankNet
+python train.py --target-balance weights --target-balance-ratio dataset \
+  --target-bce-reduction mean --rank-loss-weight 1.0 --no-class-weights
+
+# Pooled BCE with size exponent so large targets contribute less (alpha=1 ≈ equal mass)
+python train.py --target-balance weights --target-size-exponent 1.0 --no-class-weights
+
 # Random forest memory/accuracy tuning
 python train.py --model rf --n-estimators 400 --rf-batch-trees 25 --rf-shard-rows 50000
 
@@ -333,22 +355,71 @@ python train.py --model rf --n-estimators 400 --rf-batch-trees 25 --rf-shard-row
 python train.py --limit 5000
 ```
 
-After training, accuracy, precision, recall, F1, AUROC, and AUPRC are printed,
-followed by **novelty breakouts** on the test set (known/unknown protein,
-known/unknown scaffold, and the 2×2 cells relative to train). The model is
-saved to `models/` as a joblib file. Splits are saved under the matching `cache/datasets/<stem>/splits/` directory and reused only when their embedded
-row-layout signature and seed match.
+After training, accuracy, precision, recall, F1, pooled AUROC/AUPRC, and
+**macro per-target** AUROC / AUPRC / precision / recall / F1 (equal average
+over proteins with both classes; skipped single-class target count is printed)
+are reported. Precision / recall / F1 use a 0.5 probability threshold per
+target. **Novelty breakouts** add known/unknown protein and scaffold pooled
+metrics plus the same macro suite for known vs unknown proteins. The model is saved to `models/` as a
+joblib file. Splits are saved under the matching `cache/datasets/<stem>/splits/`
+directory and reused only when their embedded row-layout signature and seed
+match.
 
 MLP early stopping carves a holdout from the **training** split (~5% of train
 rows by target). It prefers a **double-cold** holdout (no protein or scaffold
 overlap with the fit set). If that holdout is too small — common when the
 protein–scaffold graph forms a giant connected component — it falls back to a
-**cold-protein** holdout. This inner ES carve is independent of
-`--test-split` / `--validation-split` (e.g. a temporal test fold does not make
-early stopping itself a future-year holdout).
+**cold-protein** holdout. Early stopping tracks **macro per-target AUROC** on
+that holdout (falling back to pooled AUROC only when no two-class target is
+evaluable). This inner ES carve is independent of `--test-split` /
+`--validation-split`. Reported test macro metrics use the same within-target
+averaging regardless of the training loss flags below.
 
-By default the MLP uses **class weights**: BCE `pos_weight = n_neg / n_pos` on
-the fit rows (inverse class frequency). Disable with `--no-class-weights`.
+`--target-balance` reshapes actives and inactives **within each protein** on
+the fit rows after the ES holdout is carved (validation/test stay unbalanced).
+`--target-balance-ratio` sets the shared active-fraction goal:
+
+| Ratio | Goal |
+| ----- | ---- |
+| `equal` | 50:50 within each target (default) |
+| `dataset` | Fit-set mean prevalence π within each target |
+
+| Mode | Behavior |
+| ---- | -------- |
+| `none` | No per-target balancing (default) |
+| `weights` | Per-target positive weight so weighted active mass fraction = goal; drop monomorphic targets |
+| `downsample` | Resample majority class toward the goal rate; drop monomorphic targets |
+| `upsample` | Duplicate scarce class toward the goal rate; drop monomorphic targets |
+
+Balancing prints ratio/π, kept/excluded target counts (`all_active` /
+`all_inactive`), and row counts before/after. It cannot be combined with
+`--class-weights`.
+
+`--target-bce-reduction` chooses how BCE is aggregated during MLP training:
+
+| Reduction | Behavior |
+| --------- | -------- |
+| `pooled` | Default. Random mixed-target minibatches; global BCE (current behavior). |
+| `mean` | Stratified batches of `T` proteins × `k` actives + `k` inactives each; loss is the average of per-target BCEs so every protein contributes equally. |
+
+Stratified batch size is `T × 2 × k`, controlled by `--rank-targets-per-batch`
+(`T`, default 32) and `--rank-samples-per-class` (`k`, default 8). In `mean`
+mode `--batch-size` is unused.
+
+`--rank-loss-weight λ` (default `0`) adds an optional within-target RankNet
+term: `L = BCE_mean + λ · rank_loss`. Requires `--target-bce-reduction mean`.
+RankNet pushes every sampled active above every sampled inactive inside each
+protein.
+
+`--target-size-exponent α` (default `0`) multiplies each row’s weight by
+`1 / n_t**α` after class balancing, where `n_t` is that protein’s fit-row
+count. Within-target class-weight ratios are preserved. Most useful with
+`pooled` BCE (`α=1` ≈ equal total weight mass per target). With `mean`
+reduction each sampled target already contributes equally, so the exponent is
+usually unnecessary.
+
+Global `--class-weights` still sets a single BCE `pos_weight = n_neg / n_pos`
+on the fit rows. Default is off (`--no-class-weights`).
 
 ## Grid search
 
@@ -363,6 +434,12 @@ python grid_search.py --data data/train/Papyrus_pp_prepared.parquet --rebuild-fe
 python grid_search.py --data data/train/Papyrus_pp_prepared.parquet \
   --test-split time --validation-split protein --rebuild-features
 
+# Per-target downsample toward dataset-average prevalence
+python grid_search.py --target-balance downsample --target-balance-ratio dataset --no-class-weights
+
+# Mean-per-target BCE (+ optional RankNet) for the whole grid
+python grid_search.py --target-bce-reduction mean --rank-loss-weight 1.0 --no-class-weights
+
 # Include assay context
 python grid_search.py --include-assay-context --rebuild-features
 
@@ -375,10 +452,12 @@ python grid_search.py --no-class-weights
 
 Iterates over MLP hyperparameter combinations (and optionally RF baselines)
 using nested `--test-split` / `--validation-split` folds (both default to
-cold-protein), prints each candidate's validation AUROC as it finishes,
-evaluates the best model on test with novelty breakouts, and saves to `models/`.
-MLP candidates inherit early stopping and `class_weights` (BCE
-`pos_weight = n_neg / n_pos`) from `config.MLP_DEFAULTS` unless overridden.
+cold-protein), prints each candidate's validation **macro per-target AUROC**
+as it finishes (pooled AUROC as fallback), evaluates the best model on test
+with novelty and macro known/unknown breakouts, and saves to `models/`.
+MLP candidates inherit early stopping, `class_weights`, `target_balance`,
+`target_bce_reduction`, `rank_loss_weight`, and `target_size_exponent`
+from CLI / `config.MLP_DEFAULTS`.
 
 ## Prediction
 
@@ -520,7 +599,7 @@ build_gpcrdb.py      Resolve GPCRdb/ChEMBL CSV → prepared Parquet (SMILES + se
 build_gpcrdb_multilabel.py  GPCRdb ligand family/target multilabel tables + vocab.
 src/prepared_schema.py  Shared BindingDB prepared columns / Parquet schema.
 src/data_prep.py     Streaming cleaning + label preparation (CSV / Parquet).
-src/lmdb_cache.py    Embedding cache with model-derived DB names.
+src/lmdb_cache.py    Embedding and Murcko scaffold LMDB caches.
 src/embeddings.py    ESM-2 and MoLFormer-XL embedders.
 src/ligand_repr.py   Fingerprints, descriptors, composite ligand reps.
 src/featurize.py     Compact feature snapshots + on-demand FeatureView.

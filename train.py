@@ -22,6 +22,7 @@ from src.ligand_repr import canonical_ligand_repr
 from src.metrics import print_breakdowns, print_metrics
 from src.models import BaseRegressor, build_model
 from src.splits import SPLIT_STRATEGIES, get_or_create_nested_split
+from src.target_balance import TARGET_BALANCE_MODES, TARGET_BALANCE_RATIOS, TARGET_BCE_REDUCTIONS
 
 
 def collect_hyperparams(args: argparse.Namespace, model_type: str) -> dict[str, Any]:
@@ -54,6 +55,13 @@ def collect_hyperparams(args: argparse.Namespace, model_type: str) -> dict[str, 
         "patience": args.patience,
         "es_val_fraction": args.es_val_fraction,
         "class_weights": args.class_weights,
+        "target_balance": args.target_balance,
+        "target_balance_ratio": args.target_balance_ratio,
+        "target_bce_reduction": args.target_bce_reduction,
+        "rank_loss_weight": args.rank_loss_weight,
+        "rank_targets_per_batch": args.rank_targets_per_batch,
+        "rank_samples_per_class": args.rank_samples_per_class,
+        "target_size_exponent": args.target_size_exponent,
         "use_batchnorm": args.batchnorm,
         "use_bilinear": args.bilinear,
         "bilinear_dim": args.bilinear_dim,
@@ -133,6 +141,8 @@ def fit_on_indices(
         fit_kwargs["groups"] = dataset.load_groups()[train_idx]
         fit_kwargs["scaffold_groups"] = dataset.load_scaffold_groups()[train_idx]
     model.fit(X_train, y_train, **fit_kwargs)
+    if model_type == "mlp" and getattr(model, "balance_summary", None) is not None:
+        model.metadata["balance_summary"] = model.balance_summary
     del X_train
     return model
 
@@ -160,7 +170,9 @@ def evaluate_on_indices(
 
     Returns:
         The metric mapping (``accuracy``, ``precision``, ``recall``, ``f1``,
-        ``auroc``, ``auprc``).
+        ``auroc``, ``auprc``, plus macro per-target ``auroc`` / ``auprc`` /
+        ``precision`` / ``recall`` / ``f1`` and evaluable/skipped counts when
+        protein ids are available).
     """
     del tag
     X_eval = dataset.feature_view(idx)
@@ -174,13 +186,13 @@ def evaluate_on_indices(
     del X_eval
     from src.metrics import compute_metrics
 
-    scores = compute_metrics(y_eval, preds)
+    eval_proteins = dataset.load_groups()[idx]
+    scores = compute_metrics(y_eval, preds, protein_ids=eval_proteins)
     if verbose:
-        print_metrics(y_eval, preds, label=label)
+        print_metrics(y_eval, preds, label=label, protein_ids=eval_proteins)
         if train_idx is not None:
             train_proteins = dataset.load_groups()[train_idx]
             train_scaffolds = dataset.load_scaffold_groups()[train_idx]
-            eval_proteins = dataset.load_groups()[idx]
             eval_scaffolds = dataset.load_scaffold_groups()[idx]
             protein_known = np.isin(eval_proteins, train_proteins)
             scaffold_known = np.isin(eval_scaffolds, train_scaffolds)
@@ -190,6 +202,7 @@ def evaluate_on_indices(
                 protein_known,
                 scaffold_known,
                 label=label,
+                protein_ids=eval_proteins,
             )
     return scores
 
@@ -433,7 +446,70 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Weight BCE positives by n_neg/n_pos on the fit rows "
             f"(default: {'on' if config.MLP_DEFAULTS['class_weights'] else 'off'}). "
+            "Incompatible with --target-balance other than none. "
             "Use --class-weights / --no-class-weights to override."
+        ),
+    )
+    p.add_argument(
+        "--target-balance",
+        choices=list(TARGET_BALANCE_MODES),
+        default=str(config.MLP_DEFAULTS["target_balance"]),
+        help=(
+            "Per-target MLP balancing: none (default), weights (per-target "
+            "pos weight), downsample majority, or upsample minority. "
+            "Excludes single-class targets and prints kept/excluded counts."
+        ),
+    )
+    p.add_argument(
+        "--target-balance-ratio",
+        choices=list(TARGET_BALANCE_RATIOS),
+        default=str(config.MLP_DEFAULTS["target_balance_ratio"]),
+        help=(
+            "Active-fraction goal for --target-balance: equal (0.5, default) "
+            "or dataset (fit-set mean prevalence). Applies to weights, "
+            "downsample, and upsample."
+        ),
+    )
+    p.add_argument(
+        "--target-bce-reduction",
+        choices=list(TARGET_BCE_REDUCTIONS),
+        default=str(config.MLP_DEFAULTS["target_bce_reduction"]),
+        help=(
+            "MLP BCE reduction: pooled (default random mixed-target batches) "
+            "or mean (stratified batches; average of per-target BCEs)."
+        ),
+    )
+    p.add_argument(
+        "--rank-loss-weight",
+        type=float,
+        default=float(config.MLP_DEFAULTS["rank_loss_weight"]),
+        help=(
+            "Weight on within-target RankNet added to mean-target BCE "
+            "(default 0). Requires --target-bce-reduction mean."
+        ),
+    )
+    p.add_argument(
+        "--rank-targets-per-batch",
+        type=int,
+        default=int(config.MLP_DEFAULTS["rank_targets_per_batch"]),
+        help="Proteins T per stratified batch when --target-bce-reduction mean.",
+    )
+    p.add_argument(
+        "--rank-samples-per-class",
+        type=int,
+        default=int(config.MLP_DEFAULTS["rank_samples_per_class"]),
+        help=(
+            "Positives and negatives k drawn per protein in a stratified batch "
+            "(effective batch size = T * 2 * k)."
+        ),
+    )
+    p.add_argument(
+        "--target-size-exponent",
+        type=float,
+        default=float(config.MLP_DEFAULTS["target_size_exponent"]),
+        help=(
+            "Scale row weights by 1/n_t**alpha after class balancing "
+            "(default 0 = off). Most useful with pooled BCE."
         ),
     )
     p.add_argument(
@@ -465,6 +541,37 @@ def main(argv: Optional[list[str]] = None) -> None:
         None.
     """
     args = build_arg_parser().parse_args(argv)
+    if args.model == "mlp" and args.target_balance != "none" and args.class_weights:
+        raise SystemExit(
+            "Cannot combine --class-weights with "
+            f"--target-balance={args.target_balance}. "
+            "Use --no-class-weights or --target-balance none."
+        )
+    if args.model == "rf" and args.target_balance != "none":
+        raise SystemExit(
+            "--target-balance is only supported for --model mlp."
+        )
+    if args.model == "rf" and (
+        args.target_bce_reduction != "pooled"
+        or args.rank_loss_weight != 0.0
+        or args.target_size_exponent != 0.0
+    ):
+        raise SystemExit(
+            "--target-bce-reduction / --rank-loss-weight / "
+            "--target-size-exponent are only supported for --model mlp."
+        )
+    if args.rank_loss_weight < 0.0:
+        raise SystemExit("--rank-loss-weight must be >= 0.")
+    if args.target_size_exponent < 0.0:
+        raise SystemExit("--target-size-exponent must be >= 0.")
+    if args.rank_loss_weight > 0.0 and args.target_bce_reduction != "mean":
+        raise SystemExit(
+            "--rank-loss-weight > 0 requires --target-bce-reduction mean."
+        )
+    if args.rank_targets_per_batch < 1 or args.rank_samples_per_class < 1:
+        raise SystemExit(
+            "--rank-targets-per-batch and --rank-samples-per-class must be >= 1."
+        )
     run_training(args)
 
 

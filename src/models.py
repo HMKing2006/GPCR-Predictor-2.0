@@ -29,8 +29,21 @@ from torch import nn
 
 import config
 from src.embeddings import select_device
-from src.metrics import auroc
+from src.metrics import auroc, macro_target_auroc
+from src.rank_batches import (
+    TargetStratifiedBatchSampler,
+    mean_target_bce_loss,
+    within_target_rank_loss,
+)
 from src.splits import cold_protein_split, double_cold_split
+from src.target_balance import (
+    TARGET_BALANCE_MODES,
+    TARGET_BALANCE_RATIOS,
+    TARGET_BCE_REDUCTIONS,
+    apply_target_balance,
+    apply_target_size_exponent,
+    format_balance_summary,
+)
 
 _PREDICT_CHUNK: int = 100_000
 
@@ -327,6 +340,13 @@ class MLPModel(BaseRegressor):
         es_val_fraction: float = float(config.MLP_DEFAULTS["es_val_fraction"]),
         es_min_delta: float = float(config.MLP_DEFAULTS["es_min_delta"]),
         class_weights: bool = bool(config.MLP_DEFAULTS["class_weights"]),
+        target_balance: str = str(config.MLP_DEFAULTS["target_balance"]),
+        target_balance_ratio: str = str(config.MLP_DEFAULTS["target_balance_ratio"]),
+        target_bce_reduction: str = str(config.MLP_DEFAULTS["target_bce_reduction"]),
+        rank_loss_weight: float = float(config.MLP_DEFAULTS["rank_loss_weight"]),
+        rank_targets_per_batch: int = int(config.MLP_DEFAULTS["rank_targets_per_batch"]),
+        rank_samples_per_class: int = int(config.MLP_DEFAULTS["rank_samples_per_class"]),
+        target_size_exponent: float = float(config.MLP_DEFAULTS["target_size_exponent"]),
         use_batchnorm: bool = bool(config.MLP_DEFAULTS["use_batchnorm"]),
         use_bilinear: bool = bool(config.MLP_DEFAULTS["use_bilinear"]),
         bilinear_dim: int = int(config.MLP_DEFAULTS["bilinear_dim"]),
@@ -341,7 +361,7 @@ class MLPModel(BaseRegressor):
             hidden_dim: Hidden layer width.
             num_layers: Number of hidden layers.
             dropout: Dropout probability.
-            batch_size: Minibatch size.
+            batch_size: Minibatch size for ``pooled`` BCE reduction.
             epochs: Maximum number of training epochs.
             learning_rate: Adam learning rate.
             weight_decay: Adam weight decay.
@@ -354,6 +374,21 @@ class MLPModel(BaseRegressor):
                 improvement.
             class_weights: If ``True``, set BCE ``pos_weight`` to
                 ``n_neg / n_pos`` on the fit rows (inverse class frequency).
+                Incompatible with non-``none`` ``target_balance``.
+            target_balance: Per-target balancing mode: ``none``, ``weights``,
+                ``downsample``, or ``upsample``. Single-class targets are
+                excluded when balancing is enabled.
+            target_balance_ratio: Active-fraction goal for balancing: ``equal``
+                (0.5) or ``dataset`` (mean prevalence on the fit rows).
+            target_bce_reduction: ``pooled`` (random mixed-target BCE) or
+                ``mean`` (stratified batches; average of per-target BCEs).
+            rank_loss_weight: Coefficient on within-target RankNet. Requires
+                ``target_bce_reduction='mean'`` when ``> 0``.
+            rank_targets_per_batch: Proteins ``T`` per stratified batch.
+            rank_samples_per_class: Positives and negatives ``k`` per protein
+                in a stratified batch.
+            target_size_exponent: Scale row weights by ``1/n_t**alpha`` after
+                class balancing. ``0`` disables.
             use_batchnorm: If ``True``, add BatchNorm1d after each hidden layer.
             use_bilinear: If ``True``, append a learned bilinear protein/ligand
                 interaction vector before the MLP trunk.
@@ -376,6 +411,51 @@ class MLPModel(BaseRegressor):
         self.es_val_fraction = float(es_val_fraction)
         self.es_min_delta = float(es_min_delta)
         self.class_weights = bool(class_weights)
+        balance = str(target_balance).strip().lower()
+        if balance not in TARGET_BALANCE_MODES:
+            raise ValueError(
+                f"Unknown target_balance {target_balance!r}; "
+                f"expected one of {TARGET_BALANCE_MODES}."
+            )
+        self.target_balance = balance
+        ratio = str(target_balance_ratio).strip().lower()
+        if ratio not in TARGET_BALANCE_RATIOS:
+            raise ValueError(
+                f"Unknown target_balance_ratio {target_balance_ratio!r}; "
+                f"expected one of {TARGET_BALANCE_RATIOS}."
+            )
+        self.target_balance_ratio = ratio
+        reduction = str(target_bce_reduction).strip().lower()
+        if reduction not in TARGET_BCE_REDUCTIONS:
+            raise ValueError(
+                f"Unknown target_bce_reduction {target_bce_reduction!r}; "
+                f"expected one of {TARGET_BCE_REDUCTIONS}."
+            )
+        self.target_bce_reduction = reduction
+        self.rank_loss_weight = float(rank_loss_weight)
+        if self.rank_loss_weight < 0.0:
+            raise ValueError(
+                f"rank_loss_weight must be >= 0; got {rank_loss_weight!r}."
+            )
+        if self.rank_loss_weight > 0.0 and reduction != "mean":
+            raise ValueError(
+                "rank_loss_weight > 0 requires --target-bce-reduction mean."
+            )
+        self.rank_targets_per_batch = int(rank_targets_per_batch)
+        self.rank_samples_per_class = int(rank_samples_per_class)
+        if self.rank_targets_per_batch < 1:
+            raise ValueError(
+                f"rank_targets_per_batch must be >= 1; got {rank_targets_per_batch}."
+            )
+        if self.rank_samples_per_class < 1:
+            raise ValueError(
+                f"rank_samples_per_class must be >= 1; got {rank_samples_per_class}."
+            )
+        self.target_size_exponent = float(target_size_exponent)
+        if self.target_size_exponent < 0.0:
+            raise ValueError(
+                f"target_size_exponent must be >= 0; got {target_size_exponent!r}."
+            )
         self.use_batchnorm = bool(use_batchnorm)
         self.use_bilinear = bool(use_bilinear)
         self.bilinear_dim = int(bilinear_dim)
@@ -388,6 +468,7 @@ class MLPModel(BaseRegressor):
         self.feature_mean: Optional[np.ndarray] = None
         self.feature_std: Optional[np.ndarray] = None
         self.pos_weight: Optional[float] = None
+        self.balance_summary: Optional[dict[str, Any]] = None
 
     def _standardize_stats(self, X: Any, rows: Optional[np.ndarray] = None) -> None:
         """Compute per-feature mean and std over selected rows in chunks.
@@ -451,20 +532,46 @@ class MLPModel(BaseRegressor):
                 chunks.append(logits.astype(np.float32, copy=False))
         return np.concatenate(chunks) if chunks else np.empty(0, dtype=np.float32)
 
-    def _eval_auroc(self, X: Any, rows: np.ndarray, y: np.ndarray) -> float:
+    def _eval_auroc(
+        self,
+        X: Any,
+        rows: np.ndarray,
+        y: np.ndarray,
+        groups: Optional[np.ndarray] = None,
+        *,
+        verbose: bool = False,
+    ) -> tuple[float, bool]:
         """Compute validation AUROC over a set of rows without tracking grads.
+
+        Prefers macro per-target AUROC when ``groups`` is provided. Falls back
+        to pooled AUROC when no two-class target is evaluable.
 
         Args:
             X: Feature matrix ``(n, d)``.
             rows: Integer row indices to evaluate.
             y: Full binary target vector ``(n,)`` (indexed by ``rows``).
+            groups: Optional full protein-id vector aligned with ``y``.
+            verbose: If ``True``, warn when falling back to pooled AUROC.
 
         Returns:
-            The AUROC on ``rows``.
+            A tuple ``(score, used_pooled_fallback)``.
         """
         logits = self._predict_logits(X, rows)
         probs = 1.0 / (1.0 + np.exp(-logits))
-        return auroc(y[rows], probs)
+        y_eval = y[rows]
+        if groups is not None:
+            macro, info = macro_target_auroc(y_eval, probs, groups[rows])
+            if info["n_evaluable"] > 0:
+                return macro, False
+            if verbose:
+                print(
+                    "[mlp] ES macroAUROC undefined "
+                    f"(targets={info['n_targets']}, skipped={info['n_skipped']}); "
+                    "falling back to pooled AUROC",
+                    flush=True,
+                )
+            return auroc(y_eval, probs), True
+        return auroc(y_eval, probs), False
 
     def fit(
         self,
@@ -479,19 +586,30 @@ class MLPModel(BaseRegressor):
         When ``patience > 0``, a holdout of about ``es_val_fraction`` of the
         rows is carved so no protein (and, when ``scaffold_groups`` is provided,
         no Murcko scaffold) appears in both the fit set and the early-stopping
-        set. After each epoch the holdout AUROC is measured; the best-performing
-        weights are cached and restored at the end, and training stops early
-        once AUROC fails to improve by ``es_min_delta`` for ``patience``
-        consecutive epochs. Early stopping is skipped when ``patience`` is
-        ``0``. When ``class_weights`` is enabled, BCE uses
-        ``pos_weight = n_neg / n_pos`` computed on the fit rows.
+        set. After each epoch the holdout macro per-target AUROC is measured;
+        the best-performing weights are cached and restored at the end, and
+        training stops early once that score fails to improve by
+        ``es_min_delta`` for ``patience`` consecutive epochs. Early stopping is
+        skipped when ``patience`` is ``0``.
+
+        Per-target balancing (``target_balance``) is applied only to fit rows
+        after the early-stopping holdout is created. Validation rows keep their
+        original class distribution. Global ``class_weights`` remains available
+        for ``target_balance='none'`` only.
+
+        With ``target_bce_reduction='mean'``, training uses target-stratified
+        batches and averages per-target BCE (optionally plus RankNet when
+        ``rank_loss_weight > 0``). ``target_size_exponent`` scales row weights
+        by ``1/n_t**alpha`` after class balancing.
 
         Args:
             X: Feature matrix ``(n, d)`` (may be a memmap).
             y: Binary target vector ``(n,)`` with labels in ``{0, 1}``.
             verbose: If ``True``, print periodic batch and per-epoch loss.
             groups: Per-row protein group ids aligned with ``X`` / ``y``.
-                Required when early stopping is enabled.
+                Required when early stopping is enabled,
+                ``target_balance != 'none'``, ``target_bce_reduction='mean'``,
+                or ``target_size_exponent > 0``.
             scaffold_groups: Optional per-row Murcko scaffold ids aligned with
                 ``X`` / ``y``. When provided with ``groups``, the early-stopping
                 holdout is double-cold (protein and scaffold disjoint).
@@ -501,24 +619,50 @@ class MLPModel(BaseRegressor):
 
         Raises:
             ValueError: If early stopping is enabled but ``groups`` is missing
-                or has the wrong length.
+                or has the wrong length, or if ``class_weights`` is combined
+                with a non-``none`` ``target_balance``.
         """
+        if self.target_balance != "none" and self.class_weights:
+            raise ValueError(
+                "Cannot combine --class-weights with "
+                f"--target-balance={self.target_balance}. "
+                "Use --no-class-weights or --target-balance none."
+            )
+        if self.target_balance != "none" and groups is None:
+            raise ValueError(
+                "Per-target balancing requires protein groups."
+            )
+        if self.target_bce_reduction == "mean" and groups is None:
+            raise ValueError(
+                "target_bce_reduction='mean' requires protein groups."
+            )
+        if self.target_size_exponent > 0.0 and groups is None:
+            raise ValueError(
+                "target_size_exponent > 0 requires protein groups."
+            )
+        if self.rank_loss_weight > 0.0 and self.target_bce_reduction != "mean":
+            raise ValueError(
+                "rank_loss_weight > 0 requires target_bce_reduction='mean'."
+            )
+
         torch.manual_seed(self.seed)
         rng = np.random.default_rng(self.seed)
         n, d = X.shape
         self.input_dim = int(d)
         y_np = np.asarray(y, dtype=np.float32)
         y_t = torch.from_numpy(y_np)
-
-        if self.patience > 0:
-            if groups is None:
-                raise ValueError(
-                    "MLP early stopping requires protein groups for a cold holdout."
-                )
+        groups_arr: Optional[np.ndarray] = None
+        if groups is not None:
             groups_arr = np.asarray(groups)
             if groups_arr.shape[0] != n:
                 raise ValueError(
                     f"groups length {groups_arr.shape[0]} does not match X rows {n}."
+                )
+
+        if self.patience > 0:
+            if groups_arr is None:
+                raise ValueError(
+                    "MLP early stopping requires protein groups for a cold holdout."
                 )
             fractions = {
                 "train": 1.0 - self.es_val_fraction,
@@ -580,7 +724,48 @@ class MLPModel(BaseRegressor):
             if verbose:
                 print("[mlp] early stopping disabled (empty cold holdout)", flush=True)
 
+        # Normalize on pre-balance fit rows so resampling does not skew scaling.
         self._standardize_stats(X, train_rows)
+
+        sample_weights: Optional[np.ndarray] = None
+        self.balance_summary = None
+        if self.target_balance != "none":
+            assert groups_arr is not None
+            balanced = apply_target_balance(
+                train_rows,
+                y_np,
+                groups_arr,
+                self.target_balance,
+                rng,
+                ratio=self.target_balance_ratio,
+            )
+            train_rows = balanced.train_rows
+            sample_weights = balanced.sample_weights
+            self.balance_summary = dict(balanced.summary)
+            if verbose:
+                print(format_balance_summary(self.target_balance, balanced.summary), flush=True)
+            if train_rows.shape[0] == 0:
+                raise ValueError(
+                    "Per-target balancing removed every fit row "
+                    "(no two-class targets remain)."
+                )
+
+        if self.target_size_exponent > 0.0:
+            assert groups_arr is not None
+            sample_weights = apply_target_size_exponent(
+                train_rows,
+                groups_arr,
+                sample_weights,
+                self.target_size_exponent,
+                n_all=n,
+            )
+            if verbose:
+                print(
+                    f"[mlp] target_size_exponent={self.target_size_exponent:g} "
+                    f"(row weights *= 1/n_t**alpha)",
+                    flush=True,
+                )
+
         self.net = _MLP(
             d,
             self.hidden_dim,
@@ -598,7 +783,54 @@ class MLPModel(BaseRegressor):
         y_fit = y_np[train_rows]
         n_pos = float(y_fit.sum())
         n_neg = float(y_fit.shape[0]) - n_pos
-        if self.class_weights and n_pos > 0.0:
+        use_mean_reduction = self.target_bce_reduction == "mean"
+        use_row_weights = sample_weights is not None
+        weight_t: Optional[torch.Tensor] = None
+        stratified: Optional[TargetStratifiedBatchSampler] = None
+        if use_mean_reduction:
+            assert groups_arr is not None
+            stratified = TargetStratifiedBatchSampler(
+                train_rows,
+                y_np,
+                groups_arr,
+                self.rank_targets_per_batch,
+                self.rank_samples_per_class,
+                rng,
+            )
+            if verbose:
+                print(
+                    f"[mlp] target_bce_reduction=mean "
+                    f"(T={self.rank_targets_per_batch}, k={self.rank_samples_per_class}, "
+                    f"batch_rows={stratified.batch_row_count}; "
+                    f"--batch-size unused)",
+                    flush=True,
+                )
+                if self.rank_loss_weight > 0.0:
+                    print(
+                        f"[mlp] rank_loss_weight={self.rank_loss_weight:g}",
+                        flush=True,
+                    )
+            self.pos_weight = None
+            if use_row_weights:
+                weight_t = torch.from_numpy(np.asarray(sample_weights, dtype=np.float32))
+                if verbose:
+                    print(
+                        f"[mlp] per-target BCE sample weights "
+                        f"(n_pos={int(n_pos)}, n_neg={int(n_neg)})",
+                        flush=True,
+                    )
+            loss_fn = None
+        elif use_row_weights:
+            self.pos_weight = None
+            loss_fn = nn.BCEWithLogitsLoss(reduction="none")
+            weight_t = torch.from_numpy(np.asarray(sample_weights, dtype=np.float32))
+            if verbose:
+                print(
+                    f"[mlp] per-target BCE sample weights "
+                    f"(n_pos={int(n_pos)}, n_neg={int(n_neg)})",
+                    flush=True,
+                )
+        elif self.class_weights and n_pos > 0.0:
             self.pos_weight = n_neg / n_pos
             loss_fn = nn.BCEWithLogitsLoss(
                 pos_weight=torch.tensor([self.pos_weight], device=self.device)
@@ -622,36 +854,95 @@ class MLPModel(BaseRegressor):
         best_state: Optional[dict[str, torch.Tensor]] = None
         best_epoch = 0
         no_improve = 0
+        warned_es_fallback = False
 
         for epoch in range(self.epochs):
             self.net.train()
-            order = rng.permutation(train_rows)
             running = 0.0
             seen = 0
-            for bstart in range(0, order.shape[0], self.batch_size):
-                rows = order[bstart : bstart + self.batch_size]
-                # BatchNorm1d cannot normalize a singleton batch in train mode.
-                if self.use_batchnorm and len(rows) < 2:
-                    continue
-                xb = self._batch_tensor(X, rows)
-                yb = y_t[rows].to(self.device)
-                optimizer.zero_grad()
-                pred = self.net(xb)
-                loss = loss_fn(pred, yb)
-                loss.backward()
-                optimizer.step()
-                running += float(loss.item()) * len(rows)
-                seen += len(rows)
-                if verbose and (bstart // self.batch_size) % 200 == 0:
-                    print(
-                        f"[mlp] epoch {epoch + 1}/{self.epochs} "
-                        f"{seen}/{order.shape[0]} rows  loss={running / seen:.4f}",
-                        flush=True,
+            if use_mean_reduction:
+                assert stratified is not None
+                batch_iter = enumerate(stratified)
+                n_epoch_rows = len(stratified) * stratified.batch_row_count
+                for b_idx, rows in batch_iter:
+                    if self.use_batchnorm and len(rows) < 2:
+                        continue
+                    xb = self._batch_tensor(X, rows)
+                    yb = y_t[rows].to(self.device)
+                    optimizer.zero_grad()
+                    pred = self.net(xb)
+                    wb = (
+                        weight_t[rows].to(self.device)
+                        if weight_t is not None
+                        else None
                     )
+                    loss = mean_target_bce_loss(
+                        pred,
+                        yb,
+                        wb,
+                        self.rank_targets_per_batch,
+                        self.rank_samples_per_class,
+                    )
+                    if self.rank_loss_weight > 0.0:
+                        loss = loss + self.rank_loss_weight * within_target_rank_loss(
+                            pred,
+                            self.rank_targets_per_batch,
+                            self.rank_samples_per_class,
+                        )
+                    loss.backward()
+                    optimizer.step()
+                    running += float(loss.item()) * len(rows)
+                    seen += len(rows)
+                    if verbose and b_idx % 200 == 0:
+                        print(
+                            f"[mlp] epoch {epoch + 1}/{self.epochs} "
+                            f"{seen}/{n_epoch_rows} rows  loss={running / seen:.4f}",
+                            flush=True,
+                        )
+            else:
+                order = rng.permutation(train_rows)
+                for bstart in range(0, order.shape[0], self.batch_size):
+                    rows = order[bstart : bstart + self.batch_size]
+                    # BatchNorm1d cannot normalize a singleton batch in train mode.
+                    if self.use_batchnorm and len(rows) < 2:
+                        continue
+                    xb = self._batch_tensor(X, rows)
+                    yb = y_t[rows].to(self.device)
+                    optimizer.zero_grad()
+                    pred = self.net(xb)
+                    if use_row_weights:
+                        assert loss_fn is not None and weight_t is not None
+                        per_row = loss_fn(pred, yb)
+                        wb = weight_t[rows].to(self.device)
+                        loss = (per_row * wb).sum() / wb.sum().clamp_min(1e-8)
+                    else:
+                        assert loss_fn is not None
+                        loss = loss_fn(pred, yb)
+                    loss.backward()
+                    optimizer.step()
+                    running += float(loss.item()) * len(rows)
+                    seen += len(rows)
+                    if verbose and (bstart // self.batch_size) % 200 == 0:
+                        print(
+                            f"[mlp] epoch {epoch + 1}/{self.epochs} "
+                            f"{seen}/{order.shape[0]} rows  loss={running / seen:.4f}",
+                            flush=True,
+                        )
 
-            val_auroc = self._eval_auroc(X, val_rows, y_np) if early_stopping else math.nan
+            if early_stopping:
+                val_auroc, used_fallback = self._eval_auroc(
+                    X,
+                    val_rows,
+                    y_np,
+                    groups=groups_arr,
+                    verbose=verbose and not warned_es_fallback,
+                )
+                if used_fallback:
+                    warned_es_fallback = True
+            else:
+                val_auroc = math.nan
             if verbose:
-                tail = f"  val_auroc={val_auroc:.4f}" if early_stopping else ""
+                tail = f"  val_macro_auroc={val_auroc:.4f}" if early_stopping else ""
                 print(
                     f"[mlp] epoch {epoch + 1}/{self.epochs} done  "
                     f"train_bce={running / max(seen, 1):.4f}{tail}",
@@ -671,7 +962,7 @@ class MLPModel(BaseRegressor):
                     if verbose:
                         print(
                             f"[mlp] early stop at epoch {epoch + 1}; "
-                            f"best val_auroc={best_auroc:.4f} @ epoch {best_epoch}",
+                            f"best val_macro_auroc={best_auroc:.4f} @ epoch {best_epoch}",
                             flush=True,
                         )
                     break
@@ -680,7 +971,8 @@ class MLPModel(BaseRegressor):
             self.net.load_state_dict(best_state)
             if verbose:
                 print(
-                    f"[mlp] restored best weights (val_auroc={best_auroc:.4f} @ epoch {best_epoch})"
+                    f"[mlp] restored best weights "
+                    f"(val_macro_auroc={best_auroc:.4f} @ epoch {best_epoch})"
                 )
         return self
     def predict(self, X: Any) -> np.ndarray:
@@ -716,6 +1008,14 @@ class MLPModel(BaseRegressor):
             "learning_rate": self.learning_rate,
             "weight_decay": self.weight_decay,
             "class_weights": self.class_weights,
+            "target_balance": self.target_balance,
+            "target_balance_ratio": self.target_balance_ratio,
+            "target_bce_reduction": self.target_bce_reduction,
+            "rank_loss_weight": self.rank_loss_weight,
+            "rank_targets_per_batch": self.rank_targets_per_batch,
+            "rank_samples_per_class": self.rank_samples_per_class,
+            "target_size_exponent": self.target_size_exponent,
+            "balance_summary": self.balance_summary,
             "pos_weight": self.pos_weight,
             "use_batchnorm": self.use_batchnorm,
             "use_bilinear": self.use_bilinear,
@@ -786,6 +1086,42 @@ def load_model(path: str) -> BaseRegressor:
                 ),
             )
         )
+        target_balance = str(
+            state.get("target_balance", config.MLP_DEFAULTS["target_balance"])
+        )
+        target_balance_ratio = str(
+            state.get(
+                "target_balance_ratio",
+                config.MLP_DEFAULTS["target_balance_ratio"],
+            )
+        )
+        target_bce_reduction = str(
+            state.get(
+                "target_bce_reduction",
+                config.MLP_DEFAULTS["target_bce_reduction"],
+            )
+        )
+        rank_loss_weight = float(
+            state.get("rank_loss_weight", config.MLP_DEFAULTS["rank_loss_weight"])
+        )
+        rank_targets_per_batch = int(
+            state.get(
+                "rank_targets_per_batch",
+                config.MLP_DEFAULTS["rank_targets_per_batch"],
+            )
+        )
+        rank_samples_per_class = int(
+            state.get(
+                "rank_samples_per_class",
+                config.MLP_DEFAULTS["rank_samples_per_class"],
+            )
+        )
+        target_size_exponent = float(
+            state.get(
+                "target_size_exponent",
+                config.MLP_DEFAULTS["target_size_exponent"],
+            )
+        )
         model = MLPModel(
             hidden_dim=state["hidden_dim"],
             num_layers=state["num_layers"],
@@ -795,6 +1131,13 @@ def load_model(path: str) -> BaseRegressor:
             learning_rate=state["learning_rate"],
             weight_decay=state["weight_decay"],
             class_weights=class_weights,
+            target_balance=target_balance,
+            target_balance_ratio=target_balance_ratio,
+            target_bce_reduction=target_bce_reduction,
+            rank_loss_weight=rank_loss_weight,
+            rank_targets_per_batch=rank_targets_per_batch,
+            rank_samples_per_class=rank_samples_per_class,
+            target_size_exponent=target_size_exponent,
             use_batchnorm=use_batchnorm,
             use_bilinear=use_bilinear,
             bilinear_dim=bilinear_dim,
@@ -806,6 +1149,7 @@ def load_model(path: str) -> BaseRegressor:
         model.pos_weight = (
             None if state.get("pos_weight") is None else float(state["pos_weight"])
         )
+        model.balance_summary = state.get("balance_summary")
         model.net = _MLP(
             state["input_dim"],
             state["hidden_dim"],

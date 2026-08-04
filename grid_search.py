@@ -2,9 +2,9 @@
 
 Each candidate is trained on the train split and scored on the validation split,
 with metrics printed as soon as the candidate finishes. The candidate with the
-highest validation AUROC is finally evaluated on the held-out test split (with
-protein/scaffold novelty breakouts) and saved. Use ``--test-split`` /
-``--validation-split`` (both default to cold-protein); e.g.
+highest validation macro per-target AUROC is finally evaluated on the held-out
+test split (with protein/scaffold novelty breakouts) and saved. Use
+``--test-split`` / ``--validation-split`` (both default to cold-protein); e.g.
 ``--test-split time --validation-split protein``.
 """
 
@@ -18,6 +18,7 @@ import config
 from src.featurize import build_features
 from src.models import BaseRegressor
 from src.splits import SPLIT_STRATEGIES
+from src.target_balance import TARGET_BALANCE_MODES, TARGET_BALANCE_RATIOS, TARGET_BCE_REDUCTIONS
 from train import _resolve_split, evaluate_on_indices, fit_on_indices
 
 # Every entry inherits MLP defaults including early stopping; ``epochs`` is a
@@ -86,6 +87,13 @@ def _merge_defaults(model_type: str, overrides: dict[str, Any]) -> dict[str, Any
             "patience": int(config.MLP_DEFAULTS["patience"]),
             "es_val_fraction": float(config.MLP_DEFAULTS["es_val_fraction"]),
             "class_weights": bool(config.MLP_DEFAULTS["class_weights"]),
+            "target_balance": str(config.MLP_DEFAULTS["target_balance"]),
+            "target_balance_ratio": str(config.MLP_DEFAULTS["target_balance_ratio"]),
+            "target_bce_reduction": str(config.MLP_DEFAULTS["target_bce_reduction"]),
+            "rank_loss_weight": float(config.MLP_DEFAULTS["rank_loss_weight"]),
+            "rank_targets_per_batch": int(config.MLP_DEFAULTS["rank_targets_per_batch"]),
+            "rank_samples_per_class": int(config.MLP_DEFAULTS["rank_samples_per_class"]),
+            "target_size_exponent": float(config.MLP_DEFAULTS["target_size_exponent"]),
             "use_batchnorm": bool(config.MLP_DEFAULTS["use_batchnorm"]),
             "use_bilinear": bool(config.MLP_DEFAULTS["use_bilinear"]),
             "bilinear_dim": int(config.MLP_DEFAULTS["bilinear_dim"]),
@@ -95,7 +103,7 @@ def _merge_defaults(model_type: str, overrides: dict[str, Any]) -> dict[str, Any
 
 
 def run_grid_search(args: argparse.Namespace) -> str:
-    """Run the grid search and save the best model by validation AUROC.
+    """Run the grid search and save the best model by validation macro AUROC.
 
     Args:
         args: Parsed CLI arguments.
@@ -118,13 +126,20 @@ def run_grid_search(args: argparse.Namespace) -> str:
 
     grid = build_grid(args.include_rf)
     best_model: Optional[BaseRegressor] = None
-    best_auroc = float("-inf")
+    best_score = float("-inf")
     best_desc = ""
 
     for index, (model_type, overrides) in enumerate(grid):
         hyperparams = _merge_defaults(model_type, overrides)
         if model_type == "mlp":
             hyperparams["class_weights"] = bool(args.class_weights)
+            hyperparams["target_balance"] = str(args.target_balance)
+            hyperparams["target_balance_ratio"] = str(args.target_balance_ratio)
+            hyperparams["target_bce_reduction"] = str(args.target_bce_reduction)
+            hyperparams["rank_loss_weight"] = float(args.rank_loss_weight)
+            hyperparams["rank_targets_per_batch"] = int(args.rank_targets_per_batch)
+            hyperparams["rank_samples_per_class"] = int(args.rank_samples_per_class)
+            hyperparams["target_size_exponent"] = float(args.target_size_exponent)
         desc = f"{model_type} {overrides}"
         print(f"\n[grid] ({index + 1}/{len(grid)}) training {desc}")
         model = fit_on_indices(
@@ -141,13 +156,30 @@ def run_grid_search(args: argparse.Namespace) -> str:
         scores = evaluate_on_indices(
             model, dataset, split["val"], label=f"[grid] {desc} val", verbose=True, tag="grid_val"
         )
-        if scores["auroc"] > best_auroc:
-            best_auroc = scores["auroc"]
+        # Prefer macro per-target AUROC; fall back to pooled when undefined.
+        if scores.get("macro_auroc_n_evaluable", 0) > 0:
+            score = float(scores["macro_auroc"])
+            score_name = "macroAUROC"
+        else:
+            score = float(scores["auroc"])
+            score_name = "AUROC"
+            print(
+                f"[grid] {desc}: no evaluable two-class val targets; "
+                "using pooled AUROC for selection",
+                flush=True,
+            )
+        print(
+            f"[grid] {desc}: select_score={score:.4f} ({score_name}) "
+            f"pooled_AUROC={scores['auroc']:.4f}",
+            flush=True,
+        )
+        if score > best_score:
+            best_score = score
             best_model = model
             best_desc = desc
 
     assert best_model is not None, "Grid search produced no model."
-    print(f"\n[grid] best (val AUROC={best_auroc:.4f}): {best_desc}")
+    print(f"\n[grid] best (val macroAUROC/AUROC={best_score:.4f}): {best_desc}")
     print("[grid] best model test-set performance:")
     evaluate_on_indices(
         best_model,
@@ -257,9 +289,64 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=bool(config.MLP_DEFAULTS["class_weights"]),
         help=(
-            "Weight MLP BCE positives by n_neg/n_pos on the fit rows (default: on). "
-            "Use --no-class-weights for unweighted BCE."
+            "Weight MLP BCE positives by n_neg/n_pos on the fit rows "
+            f"(default: {'on' if config.MLP_DEFAULTS['class_weights'] else 'off'}). "
+            "Incompatible with --target-balance other than none."
         ),
+    )
+    p.add_argument(
+        "--target-balance",
+        choices=list(TARGET_BALANCE_MODES),
+        default=str(config.MLP_DEFAULTS["target_balance"]),
+        help=(
+            "Per-target MLP balancing: none (default), weights, downsample, "
+            "or upsample. Excludes single-class targets."
+        ),
+    )
+    p.add_argument(
+        "--target-balance-ratio",
+        choices=list(TARGET_BALANCE_RATIOS),
+        default=str(config.MLP_DEFAULTS["target_balance_ratio"]),
+        help=(
+            "Active-fraction goal for --target-balance: equal (0.5, default) "
+            "or dataset (fit-set mean prevalence)."
+        ),
+    )
+    p.add_argument(
+        "--target-bce-reduction",
+        choices=list(TARGET_BCE_REDUCTIONS),
+        default=str(config.MLP_DEFAULTS["target_bce_reduction"]),
+        help=(
+            "MLP BCE reduction: pooled (default) or mean (stratified "
+            "per-target BCE). "
+        ),
+    )
+    p.add_argument(
+        "--rank-loss-weight",
+        type=float,
+        default=float(config.MLP_DEFAULTS["rank_loss_weight"]),
+        help=(
+            "Weight on within-target RankNet (default 0). Requires "
+            "--target-bce-reduction mean."
+        ),
+    )
+    p.add_argument(
+        "--rank-targets-per-batch",
+        type=int,
+        default=int(config.MLP_DEFAULTS["rank_targets_per_batch"]),
+        help="Proteins T per stratified batch when reduction is mean.",
+    )
+    p.add_argument(
+        "--rank-samples-per-class",
+        type=int,
+        default=int(config.MLP_DEFAULTS["rank_samples_per_class"]),
+        help="Positives and negatives k per protein in a stratified batch.",
+    )
+    p.add_argument(
+        "--target-size-exponent",
+        type=float,
+        default=float(config.MLP_DEFAULTS["target_size_exponent"]),
+        help="Scale row weights by 1/n_t**alpha after class balancing (0=off).",
     )
     p.add_argument("--quiet", action="store_true")
     return p
@@ -275,6 +362,24 @@ def main(argv: Optional[list[str]] = None) -> None:
         None.
     """
     args = build_arg_parser().parse_args(argv)
+    if args.target_balance != "none" and args.class_weights:
+        raise SystemExit(
+            "Cannot combine --class-weights with "
+            f"--target-balance={args.target_balance}. "
+            "Use --no-class-weights or --target-balance none."
+        )
+    if args.rank_loss_weight < 0.0:
+        raise SystemExit("--rank-loss-weight must be >= 0.")
+    if args.target_size_exponent < 0.0:
+        raise SystemExit("--target-size-exponent must be >= 0.")
+    if args.rank_loss_weight > 0.0 and args.target_bce_reduction != "mean":
+        raise SystemExit(
+            "--rank-loss-weight > 0 requires --target-bce-reduction mean."
+        )
+    if args.rank_targets_per_batch < 1 or args.rank_samples_per_class < 1:
+        raise SystemExit(
+            "--rank-targets-per-batch and --rank-samples-per-class must be >= 1."
+        )
     run_grid_search(args)
 
 

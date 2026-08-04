@@ -163,6 +163,16 @@ RF_DEFAULTS: Final[dict[str, int]] = {
 # ``class_weights`` sets BCE ``pos_weight`` to ``n_neg / n_pos`` on the fit
 # rows (inverse class frequency) to counter sparse actives; disable for plain BCE.
 # Default is off to match the screening GUI checkpoint.
+# ``target_balance`` reshapes actives/inactives *within each protein* via
+# ``none`` / ``weights`` / ``downsample`` / ``upsample`` (mutually exclusive
+# with ``class_weights`` when not ``none``). Single-class targets are excluded.
+# ``target_balance_ratio`` selects the per-target active fraction goal:
+# ``equal`` (0.5) or ``dataset`` (fit-set mean prevalence).
+# ``target_bce_reduction``: ``pooled`` (default random-batch BCE) or ``mean``
+# (stratified batches; average of per-target BCEs). ``rank_loss_weight`` adds
+# optional within-target RankNet (requires ``mean``). ``target_size_exponent``
+# scales row weights by ``1/n_t**alpha`` after class balancing.
+# Early stopping and grid selection use macro per-target AUROC.
 # ``use_batchnorm`` inserts BatchNorm1d after each hidden linear layer.
 # ``use_bilinear`` adds a learned protein/ligand bilinear interaction block: the
 # protein and ligand embeddings are projected to ``bilinear_dim`` and combined by
@@ -179,6 +189,13 @@ MLP_DEFAULTS: Final[dict[str, Any]] = {
     "es_val_fraction": 0.05,
     "es_min_delta": 1e-4,
     "class_weights": False,
+    "target_balance": "none",
+    "target_balance_ratio": "equal",
+    "target_bce_reduction": "pooled",
+    "rank_loss_weight": 0.0,
+    "rank_targets_per_batch": 32,
+    "rank_samples_per_class": 8,
+    "target_size_exponent": 0.0,
     "use_batchnorm": False,
     "use_bilinear": False,
     "bilinear_dim": 256,

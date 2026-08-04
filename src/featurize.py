@@ -15,7 +15,7 @@ import os
 import re
 import shutil
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional, Sequence
 
 import numpy as np
@@ -26,12 +26,92 @@ import config
 from src.data_prep import binarize_pactivity, iter_prepared_rows
 from src.embeddings import HFEmbedder, protein_embedder
 from src.ligand_repr import CompositeLigandFeaturizer, canonical_ligand_repr, parse_ligand_repr
-from src.lmdb_cache import EmbeddingCache
+from src.lmdb_cache import SCAFFOLD_ORPHAN_SENTINEL, EmbeddingCache, ScaffoldCache
 
 _ASSAY_TO_INDEX: dict[str, int] = {name: i for i, name in enumerate(config.ASSAY_TYPES)}
 _ROW_CHUNK: int = 50_000
 _PROGRESS_EVERY: int = 200_000
+_SCAFFOLD_FLUSH_EVERY: int = 50_000
 _STORAGE_VERSION: str = "id_gather_v1"
+
+
+def _compute_murcko_scaffold(smiles: str) -> Optional[str]:
+    """Compute the Bemis-Murcko scaffold of a ligand SMILES.
+
+    Args:
+        smiles: Canonical ligand SMILES.
+
+    Returns:
+        Scaffold SMILES, or ``None`` if the ligand cannot be parsed or has no
+        Murcko scaffold.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    try:
+        scaffold = MurckoScaffold.MurckoScaffoldSmiles(mol=mol)
+    except Exception:
+        return None
+    return scaffold or None
+
+
+@dataclass
+class MurckoScaffoldResolver:
+    """Resolve Murcko scaffold keys with in-memory and LMDB memoization."""
+
+    cache: Optional[ScaffoldCache] = None
+    _memo: dict[str, str] = field(default_factory=dict)
+    _pending: dict[str, str] = field(default_factory=dict)
+
+    def resolve(self, smiles: str, row_index: int) -> str:
+        """Return a scaffold group key for one ligand SMILES.
+
+        Args:
+            smiles: Canonical ligand SMILES.
+            row_index: Zero-based row index used for orphan fallback keys.
+
+        Returns:
+            Scaffold SMILES, or a unique row key when scaffolding fails.
+        """
+        stored = self._lookup(smiles)
+        if stored == SCAFFOLD_ORPHAN_SENTINEL:
+            return f"__orphan_{row_index}"
+        return stored
+
+    def _lookup(self, smiles: str) -> str:
+        """Resolve the cached or computed scaffold value for one SMILES.
+
+        Args:
+            smiles: Canonical ligand SMILES.
+
+        Returns:
+            Scaffold SMILES or :data:`SCAFFOLD_ORPHAN_SENTINEL`.
+        """
+        if smiles in self._memo:
+            return self._memo[smiles]
+        if self.cache is not None:
+            cached = self.cache.get(smiles)
+            if cached is not None:
+                self._memo[smiles] = cached
+                return cached
+        computed = _compute_murcko_scaffold(smiles)
+        stored = computed if computed is not None else SCAFFOLD_ORPHAN_SENTINEL
+        self._memo[smiles] = stored
+        if self.cache is not None:
+            self._pending[smiles] = stored
+            if len(self._pending) >= _SCAFFOLD_FLUSH_EVERY:
+                self.flush()
+        return stored
+
+    def flush(self) -> None:
+        """Persist pending scaffold values to the LMDB cache.
+
+        Returns:
+            None.
+        """
+        if self.cache is not None and self._pending:
+            self.cache.put_many(self._pending)
+            self._pending.clear()
 
 
 def murcko_scaffold_key(smiles: str, row_index: int) -> str:
@@ -44,14 +124,7 @@ def murcko_scaffold_key(smiles: str, row_index: int) -> str:
     Returns:
         Scaffold SMILES, or a unique row key when scaffolding fails.
     """
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return f"__orphan_{row_index}"
-    try:
-        scaffold = MurckoScaffold.MurckoScaffoldSmiles(mol=mol)
-    except Exception:
-        return f"__orphan_{row_index}"
-    return scaffold or f"__orphan_{row_index}"
+    return MurckoScaffoldResolver().resolve(smiles, row_index)
 
 
 def assay_onehot(assay_type: str) -> np.ndarray:
@@ -322,29 +395,32 @@ def _index_rows(
 
     if verbose:
         print("[features] streaming and indexing prepared rows", flush=True)
-    for kept, row in enumerate(iter_prepared_rows(source_path, limit=limit), start=1):
-        row_index = kept - 1
-        ligand_ids.append(ligand_index.setdefault(row.smiles, len(ligand_index)))
-        protein_ids.append(protein_index.setdefault(row.sequence, len(protein_index)))
-        scaffold = murcko_scaffold_key(row.smiles, row_index)
-        scaffold_ids.append(scaffold_index.setdefault(scaffold, len(scaffold_index)))
-        assay_ids.append(_ASSAY_TO_INDEX[row.assay_type])
-        ph_values.append(row.ph)
-        temperatures.append(row.temp)
-        years.append(-1 if row.year is None else int(row.year))
-        if row.activity_label is not None:
-            labels.append(int(row.activity_label))
-        else:
-            label = binarize_pactivity(
-                np.asarray([row.pactivity]), threshold_nm=activity_threshold_nm
-            )[0]
-            labels.append(int(label))
-        if verbose and kept % _PROGRESS_EVERY == 0:
-            print(
-                f"[features] indexed {kept} rows "
-                f"({len(protein_index)} proteins, {len(ligand_index)} ligands)",
-                flush=True,
-            )
+    with ScaffoldCache() as scaffold_cache:
+        resolver = MurckoScaffoldResolver(cache=scaffold_cache)
+        for kept, row in enumerate(iter_prepared_rows(source_path, limit=limit), start=1):
+            row_index = kept - 1
+            ligand_ids.append(ligand_index.setdefault(row.smiles, len(ligand_index)))
+            protein_ids.append(protein_index.setdefault(row.sequence, len(protein_index)))
+            scaffold = resolver.resolve(row.smiles, row_index)
+            scaffold_ids.append(scaffold_index.setdefault(scaffold, len(scaffold_index)))
+            assay_ids.append(_ASSAY_TO_INDEX[row.assay_type])
+            ph_values.append(row.ph)
+            temperatures.append(row.temp)
+            years.append(-1 if row.year is None else int(row.year))
+            if row.activity_label is not None:
+                labels.append(int(row.activity_label))
+            else:
+                label = binarize_pactivity(
+                    np.asarray([row.pactivity]), threshold_nm=activity_threshold_nm
+                )[0]
+                labels.append(int(label))
+            if verbose and kept % _PROGRESS_EVERY == 0:
+                print(
+                    f"[features] indexed {kept} rows "
+                    f"({len(protein_index)} proteins, {len(ligand_index)} ligands)",
+                    flush=True,
+                )
+        resolver.flush()
 
     if not labels:
         raise ValueError(f"No valid training rows produced from {source_path}.")
