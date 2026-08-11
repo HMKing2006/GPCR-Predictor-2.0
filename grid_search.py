@@ -4,8 +4,8 @@ Each candidate is trained on the train split and scored on the validation split,
 with metrics printed as soon as the candidate finishes. The candidate with the
 highest validation macro per-target AUROC is finally evaluated on the held-out
 test split (with protein/scaffold novelty breakouts) and saved. Use
-``--test-split`` / ``--validation-split`` (both default to cold-protein); e.g.
-``--test-split time --validation-split protein``.
+``--test-split`` / ``--validation-split`` (defaults: time test, cold-protein
+val); e.g. ``--test-split time --validation-split protein``.
 """
 
 from __future__ import annotations
@@ -86,6 +86,7 @@ def _merge_defaults(model_type: str, overrides: dict[str, Any]) -> dict[str, Any
             "weight_decay": float(config.MLP_DEFAULTS["weight_decay"]),
             "patience": int(config.MLP_DEFAULTS["patience"]),
             "es_val_fraction": float(config.MLP_DEFAULTS["es_val_fraction"]),
+            "es_metric": str(config.MLP_DEFAULTS["es_metric"]),
             "class_weights": bool(config.MLP_DEFAULTS["class_weights"]),
             "target_balance": str(config.MLP_DEFAULTS["target_balance"]),
             "target_balance_ratio": str(config.MLP_DEFAULTS["target_balance_ratio"]),
@@ -227,7 +228,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=list(SPLIT_STRATEGIES),
         default=config.DEFAULT_TEST_SPLIT,
         help=(
-            "Strategy for the held-out test fold: cold-protein (default), "
+            "Strategy for the held-out test fold (default: time): cold-protein, "
             "double-cold protein+scaffold, or publication-year time."
         ),
     )

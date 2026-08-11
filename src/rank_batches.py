@@ -203,3 +203,32 @@ def within_target_rank_loss(
     neg = scores[:, k:]
     diff = pos.unsqueeze(2) - neg.unsqueeze(1)
     return F.softplus(-diff).mean()
+
+
+def within_target_listwise_loss(
+    logits: torch.Tensor,
+    n_targets: int,
+    samples_per_class: int,
+) -> torch.Tensor:
+    """ListNet cross-entropy over within-target score lists.
+
+    Treats each stratified target block as a list: positives share uniform
+    probability mass ``1/k`` and negatives get zero. Optimizing this pushes
+    probability mass onto actives as a group (listwise ranking / soft AUROC).
+
+    Args:
+        logits: Model logits shaped ``(T * 2 * k,)`` with layout
+            ``[pos…, neg…]`` per target.
+        n_targets: Number of proteins ``T`` in the batch.
+        samples_per_class: Positives/negatives ``k`` per protein.
+
+    Returns:
+        Scalar mean-over-targets listwise CE loss.
+    """
+    t = int(n_targets)
+    k = int(samples_per_class)
+    scores = logits.view(t, 2 * k)
+    target = torch.zeros_like(scores)
+    target[:, :k] = 1.0 / float(k)
+    log_probs = F.log_softmax(scores, dim=1)
+    return -(target * log_probs).sum(dim=1).mean()

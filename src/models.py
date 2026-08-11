@@ -19,20 +19,24 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import joblib
 import numpy as np
 import torch
+import torch.nn.functional as F
 from sklearn.ensemble import RandomForestClassifier
 from torch import nn
 
 import config
 from src.embeddings import select_device
-from src.metrics import auroc, macro_target_auroc
+from src.metrics import auroc, macro_target_auroc, macro_target_metrics
+ES_METRICS: tuple[str, ...] = ("auroc", "auprc", "precision", "recall", "f1")
+
 from src.rank_batches import (
     TargetStratifiedBatchSampler,
     mean_target_bce_loss,
+    within_target_listwise_loss,
     within_target_rank_loss,
 )
 from src.splits import cold_protein_split, double_cold_split
@@ -43,6 +47,7 @@ from src.target_balance import (
     apply_target_balance,
     apply_target_size_exponent,
     format_balance_summary,
+    resolve_target_active_fraction,
 )
 
 _PREDICT_CHUNK: int = 100_000
@@ -242,14 +247,19 @@ class RandomForestModel(BaseRegressor):
 
 
 class _MLP(nn.Module):
-    """Feed-forward network over pooled features with an optional bilinear head.
+    """Pair scorer over protein/ligand features (concat, bilinear, or FiLM).
 
     The input row is laid out as ``[protein | ligand]`` by default, or
     ``[protein | ligand | assay_onehot | pH | temp]`` when assay context is
-    enabled. When bilinear mode is enabled, the protein and ligand slices are
-    projected to a shared width, mixed through ``nn.Bilinear``, and the
-    resulting interaction vector is concatenated back onto the original feature
-    row before the MLP trunk.
+    enabled.
+
+    Modes:
+    - Default concat MLP over the full feature row.
+    - ``use_bilinear``: project protein/ligand, mix with ``nn.Bilinear``, concat
+      the interaction vector onto the original row, then run the MLP trunk.
+    - ``use_film``: encode the ligand, FiLM-modulate with scale/shift from the
+      protein embedding, then score; adds a protein-only bias for prevalence
+      transfer. Mutually exclusive with bilinear.
     """
 
     def __init__(
@@ -264,8 +274,9 @@ class _MLP(nn.Module):
         use_batchnorm: bool = False,
         use_bilinear: bool = False,
         bilinear_dim: int = 256,
+        use_film: bool = False,
     ) -> None:
-        """Build the optional bilinear head and MLP trunk.
+        """Build the selected pair-scoring architecture.
 
         Args:
             input_dim: Full feature-vector length.
@@ -275,16 +286,48 @@ class _MLP(nn.Module):
             protein_dim: Length of the leading protein-embedding slice.
             ligand_dim: Length of the ligand-embedding slice that follows it.
             use_batchnorm: If ``True``, insert ``BatchNorm1d`` after each hidden
-                linear layer.
+                linear layer (concat / bilinear modes only).
             use_bilinear: If ``True``, append a learned bilinear protein/ligand
                 interaction vector before the MLP trunk.
             bilinear_dim: Shared width for the protein/ligand projections and the
                 bilinear interaction block.
+            use_film: If ``True``, use FiLM-conditioned ligand scoring instead of
+                the concat MLP. Mutually exclusive with ``use_bilinear``.
+
+        Raises:
+            ValueError: If ``use_film`` and ``use_bilinear`` are both enabled.
         """
         super().__init__()
         self.protein_dim = int(protein_dim)
         self.ligand_dim = int(ligand_dim)
         self.use_bilinear = bool(use_bilinear)
+        self.use_film = bool(use_film)
+        if self.use_film and self.use_bilinear:
+            raise ValueError("use_film and use_bilinear are mutually exclusive.")
+
+        if self.use_film:
+            self.ligand_in = nn.Linear(self.ligand_dim, hidden_dim)
+            film_layers: list[nn.Module] = [
+                nn.Linear(self.protein_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 2 * hidden_dim),
+            ]
+            self.film_net = nn.Sequential(*film_layers)
+            post: list[nn.Module] = []
+            depth = max(1, int(num_layers) - 1)
+            for _ in range(depth):
+                post += [
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                ]
+            self.post = nn.Sequential(*post)
+            self.head = nn.Linear(hidden_dim, 1)
+            self.protein_bias = nn.Linear(self.protein_dim, 1)
+            self.net = None
+            return
+
         trunk_input_dim = input_dim
         if self.use_bilinear:
             self.protein_proj = nn.Linear(self.protein_dim, bilinear_dim)
@@ -312,6 +355,16 @@ class _MLP(nn.Module):
         Returns:
             Output batch ``(batch,)``.
         """
+        if self.use_film:
+            protein = x[:, : self.protein_dim]
+            ligand = x[:, self.protein_dim : self.protein_dim + self.ligand_dim]
+            h = F.relu(self.ligand_in(ligand))
+            gamma, beta = self.film_net(protein).chunk(2, dim=-1)
+            # Softplus keeps scale positive so FiLM cannot flip ligand features.
+            h = F.softplus(gamma) * h + beta
+            h = self.post(h)
+            return self.head(h).squeeze(-1) + self.protein_bias(protein).squeeze(-1)
+
         if self.use_bilinear:
             protein = x[:, : self.protein_dim]
             ligand = x[:, self.protein_dim : self.protein_dim + self.ligand_dim]
@@ -319,6 +372,7 @@ class _MLP(nn.Module):
             ligand_proj = self.ligand_proj(ligand)
             bilinear = self.bilinear(protein_proj, ligand_proj)
             x = torch.cat([x, bilinear], dim=1)
+        assert self.net is not None
         return self.net(x).squeeze(-1)
 
 
@@ -339,17 +393,22 @@ class MLPModel(BaseRegressor):
         patience: int = int(config.MLP_DEFAULTS["patience"]),
         es_val_fraction: float = float(config.MLP_DEFAULTS["es_val_fraction"]),
         es_min_delta: float = float(config.MLP_DEFAULTS["es_min_delta"]),
+        es_metric: str = str(config.MLP_DEFAULTS["es_metric"]),
         class_weights: bool = bool(config.MLP_DEFAULTS["class_weights"]),
         target_balance: str = str(config.MLP_DEFAULTS["target_balance"]),
         target_balance_ratio: str = str(config.MLP_DEFAULTS["target_balance_ratio"]),
         target_bce_reduction: str = str(config.MLP_DEFAULTS["target_bce_reduction"]),
         rank_loss_weight: float = float(config.MLP_DEFAULTS["rank_loss_weight"]),
+        listwise_loss_weight: float = float(
+            config.MLP_DEFAULTS["listwise_loss_weight"]
+        ),
         rank_targets_per_batch: int = int(config.MLP_DEFAULTS["rank_targets_per_batch"]),
         rank_samples_per_class: int = int(config.MLP_DEFAULTS["rank_samples_per_class"]),
         target_size_exponent: float = float(config.MLP_DEFAULTS["target_size_exponent"]),
         use_batchnorm: bool = bool(config.MLP_DEFAULTS["use_batchnorm"]),
         use_bilinear: bool = bool(config.MLP_DEFAULTS["use_bilinear"]),
         bilinear_dim: int = int(config.MLP_DEFAULTS["bilinear_dim"]),
+        use_film: bool = bool(config.MLP_DEFAULTS["use_film"]),
         protein_dim: int = config.PROTEIN_EMB_DIM,
         ligand_dim: int = config.LIGAND_EMB_DIM,
         seed: int = config.RANDOM_SEED,
@@ -369,9 +428,11 @@ class MLPModel(BaseRegressor):
                 stopping early. ``0`` disables early stopping.
             es_val_fraction: Target fraction of training *rows* held out as a
                 cold-protein early-stopping set (proteins disjoint from the
-                fit set).
-            es_min_delta: Minimum validation-AUROC increase counted as an
+                fit set; double-cold when scaffolds are provided).
+            es_min_delta: Minimum validation-score increase counted as an
                 improvement.
+            es_metric: Macro per-target early-stop score: one of ``auroc``,
+                ``auprc``, ``precision``, ``recall``, ``f1``.
             class_weights: If ``True``, set BCE ``pos_weight`` to
                 ``n_neg / n_pos`` on the fit rows (inverse class frequency).
                 Incompatible with non-``none`` ``target_balance``.
@@ -384,6 +445,8 @@ class MLPModel(BaseRegressor):
                 ``mean`` (stratified batches; average of per-target BCEs).
             rank_loss_weight: Coefficient on within-target RankNet. Requires
                 ``target_bce_reduction='mean'`` when ``> 0``.
+            listwise_loss_weight: Coefficient on within-target ListNet CE.
+                Requires ``target_bce_reduction='mean'`` when ``> 0``.
             rank_targets_per_batch: Proteins ``T`` per stratified batch.
             rank_samples_per_class: Positives and negatives ``k`` per protein
                 in a stratified batch.
@@ -394,6 +457,8 @@ class MLPModel(BaseRegressor):
                 interaction vector before the MLP trunk.
             bilinear_dim: Shared width for the protein/ligand projections and the
                 bilinear interaction block.
+            use_film: If ``True``, use FiLM-conditioned ligand scoring instead of
+                concat MLP. Mutually exclusive with ``use_bilinear``.
             protein_dim: Length of the protein-embedding slice in each row.
             ligand_dim: Length of the ligand-embedding slice in each row.
             seed: Random seed.
@@ -410,6 +475,12 @@ class MLPModel(BaseRegressor):
         self.patience = int(patience)
         self.es_val_fraction = float(es_val_fraction)
         self.es_min_delta = float(es_min_delta)
+        metric = str(es_metric).strip().lower()
+        if metric not in ES_METRICS:
+            raise ValueError(
+                f"Unknown es_metric {es_metric!r}; expected one of {ES_METRICS}."
+            )
+        self.es_metric = metric
         self.class_weights = bool(class_weights)
         balance = str(target_balance).strip().lower()
         if balance not in TARGET_BALANCE_MODES:
@@ -418,13 +489,19 @@ class MLPModel(BaseRegressor):
                 f"expected one of {TARGET_BALANCE_MODES}."
             )
         self.target_balance = balance
-        ratio = str(target_balance_ratio).strip().lower()
-        if ratio not in TARGET_BALANCE_RATIOS:
+        ratio = target_balance_ratio
+        # Validate equal/dataset/custom float; store the original policy token.
+        try:
+            resolve_target_active_fraction(ratio, y_fit=np.asarray([0.0, 1.0]))
+        except ValueError as exc:
             raise ValueError(
                 f"Unknown target_balance_ratio {target_balance_ratio!r}; "
-                f"expected one of {TARGET_BALANCE_RATIOS}."
-            )
-        self.target_balance_ratio = ratio
+                f"expected one of {TARGET_BALANCE_RATIOS} or a float in (0, 1)."
+            ) from exc
+        if isinstance(ratio, str):
+            self.target_balance_ratio: Union[str, float] = ratio.strip().lower()
+        else:
+            self.target_balance_ratio = float(ratio)
         reduction = str(target_bce_reduction).strip().lower()
         if reduction not in TARGET_BCE_REDUCTIONS:
             raise ValueError(
@@ -440,6 +517,15 @@ class MLPModel(BaseRegressor):
         if self.rank_loss_weight > 0.0 and reduction != "mean":
             raise ValueError(
                 "rank_loss_weight > 0 requires --target-bce-reduction mean."
+            )
+        self.listwise_loss_weight = float(listwise_loss_weight)
+        if self.listwise_loss_weight < 0.0:
+            raise ValueError(
+                f"listwise_loss_weight must be >= 0; got {listwise_loss_weight!r}."
+            )
+        if self.listwise_loss_weight > 0.0 and reduction != "mean":
+            raise ValueError(
+                "listwise_loss_weight > 0 requires --target-bce-reduction mean."
             )
         self.rank_targets_per_batch = int(rank_targets_per_batch)
         self.rank_samples_per_class = int(rank_samples_per_class)
@@ -459,6 +545,9 @@ class MLPModel(BaseRegressor):
         self.use_batchnorm = bool(use_batchnorm)
         self.use_bilinear = bool(use_bilinear)
         self.bilinear_dim = int(bilinear_dim)
+        self.use_film = bool(use_film)
+        if self.use_film and self.use_bilinear:
+            raise ValueError("use_film and use_bilinear are mutually exclusive.")
         self.protein_dim = int(protein_dim)
         self.ligand_dim = int(ligand_dim)
         self.input_dim: Optional[int] = None
@@ -541,10 +630,11 @@ class MLPModel(BaseRegressor):
         *,
         verbose: bool = False,
     ) -> tuple[float, bool]:
-        """Compute validation AUROC over a set of rows without tracking grads.
+        """Compute the early-stop score over a set of rows without tracking grads.
 
-        Prefers macro per-target AUROC when ``groups`` is provided. Falls back
-        to pooled AUROC when no two-class target is evaluable.
+        Prefers the configured macro per-target ``es_metric`` when ``groups`` is
+        provided. Falls back to pooled AUROC when no two-class target is
+        evaluable.
 
         Args:
             X: Feature matrix ``(n, d)``.
@@ -556,22 +646,49 @@ class MLPModel(BaseRegressor):
         Returns:
             A tuple ``(score, used_pooled_fallback)``.
         """
+        score, _macros, fallback = self._eval_es_metrics(
+            X, rows, y, groups=groups, verbose=verbose
+        )
+        return score, fallback
+
+    def _eval_es_metrics(
+        self,
+        X: Any,
+        rows: np.ndarray,
+        y: np.ndarray,
+        groups: Optional[np.ndarray] = None,
+        *,
+        verbose: bool = False,
+    ) -> tuple[float, dict[str, float], bool]:
+        """Compute macro ES metrics and the selected early-stop score.
+
+        Args:
+            X: Feature matrix ``(n, d)``.
+            rows: Integer row indices to evaluate.
+            y: Full binary target vector ``(n,)`` (indexed by ``rows``).
+            groups: Optional full protein-id vector aligned with ``y``.
+            verbose: If ``True``, warn when falling back to pooled AUROC.
+
+        Returns:
+            A tuple ``(score, macros, used_pooled_fallback)``. ``macros`` is
+            empty when pooled fallback is used.
+        """
         logits = self._predict_logits(X, rows)
-        probs = 1.0 / (1.0 + np.exp(-logits))
+        probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -50.0, 50.0)))
         y_eval = y[rows]
         if groups is not None:
-            macro, info = macro_target_auroc(y_eval, probs, groups[rows])
+            macros, info = macro_target_metrics(y_eval, probs, groups[rows])
             if info["n_evaluable"] > 0:
-                return macro, False
+                return float(macros[self.es_metric]), macros, False
             if verbose:
                 print(
-                    "[mlp] ES macroAUROC undefined "
+                    f"[mlp] ES macro{self.es_metric.upper()} undefined "
                     f"(targets={info['n_targets']}, skipped={info['n_skipped']}); "
                     "falling back to pooled AUROC",
                     flush=True,
                 )
-            return auroc(y_eval, probs), True
-        return auroc(y_eval, probs), False
+            return auroc(y_eval, probs), {}, True
+        return auroc(y_eval, probs), {}, False
 
     def fit(
         self,
@@ -643,6 +760,10 @@ class MLPModel(BaseRegressor):
         if self.rank_loss_weight > 0.0 and self.target_bce_reduction != "mean":
             raise ValueError(
                 "rank_loss_weight > 0 requires target_bce_reduction='mean'."
+            )
+        if self.listwise_loss_weight > 0.0 and self.target_bce_reduction != "mean":
+            raise ValueError(
+                "listwise_loss_weight > 0 requires target_bce_reduction='mean'."
             )
 
         torch.manual_seed(self.seed)
@@ -776,7 +897,10 @@ class MLPModel(BaseRegressor):
             use_batchnorm=self.use_batchnorm,
             use_bilinear=self.use_bilinear,
             bilinear_dim=self.bilinear_dim,
+            use_film=self.use_film,
         ).to(self.device)
+        if verbose and self.use_film:
+            print("[mlp] architecture=film", flush=True)
         optimizer = torch.optim.Adam(
             self.net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
         )
@@ -808,6 +932,11 @@ class MLPModel(BaseRegressor):
                 if self.rank_loss_weight > 0.0:
                     print(
                         f"[mlp] rank_loss_weight={self.rank_loss_weight:g}",
+                        flush=True,
+                    )
+                if self.listwise_loss_weight > 0.0:
+                    print(
+                        f"[mlp] listwise_loss_weight={self.listwise_loss_weight:g}",
                         flush=True,
                     )
             self.pos_weight = None
@@ -889,6 +1018,12 @@ class MLPModel(BaseRegressor):
                             self.rank_targets_per_batch,
                             self.rank_samples_per_class,
                         )
+                    if self.listwise_loss_weight > 0.0:
+                        loss = loss + self.listwise_loss_weight * within_target_listwise_loss(
+                            pred,
+                            self.rank_targets_per_batch,
+                            self.rank_samples_per_class,
+                        )
                     loss.backward()
                     optimizer.step()
                     running += float(loss.item()) * len(rows)
@@ -930,7 +1065,7 @@ class MLPModel(BaseRegressor):
                         )
 
             if early_stopping:
-                val_auroc, used_fallback = self._eval_auroc(
+                val_score, val_macros, used_fallback = self._eval_es_metrics(
                     X,
                     val_rows,
                     y_np,
@@ -940,9 +1075,22 @@ class MLPModel(BaseRegressor):
                 if used_fallback:
                     warned_es_fallback = True
             else:
-                val_auroc = math.nan
+                val_score = math.nan
+                val_macros = {}
             if verbose:
-                tail = f"  val_macro_auroc={val_auroc:.4f}" if early_stopping else ""
+                if early_stopping and val_macros:
+                    tail = (
+                        f"  val_macro_auroc={val_macros['auroc']:.4f}"
+                        f"  val_macro_auprc={val_macros['auprc']:.4f}"
+                        f"  val_macro_prec={val_macros['precision']:.4f}"
+                        f"  val_macro_rec={val_macros['recall']:.4f}"
+                        f"  val_macro_f1={val_macros['f1']:.4f}"
+                        f"  es={self.es_metric}:{val_score:.4f}"
+                    )
+                elif early_stopping:
+                    tail = f"  es={self.es_metric}:{val_score:.4f}"
+                else:
+                    tail = ""
                 print(
                     f"[mlp] epoch {epoch + 1}/{self.epochs} done  "
                     f"train_bce={running / max(seen, 1):.4f}{tail}",
@@ -951,8 +1099,8 @@ class MLPModel(BaseRegressor):
 
             if not early_stopping:
                 continue
-            if val_auroc - best_auroc > self.es_min_delta:
-                best_auroc = val_auroc
+            if val_score - best_auroc > self.es_min_delta:
+                best_auroc = val_score
                 best_epoch = epoch + 1
                 best_state = {k: v.detach().cpu().clone() for k, v in self.net.state_dict().items()}
                 no_improve = 0
@@ -962,7 +1110,8 @@ class MLPModel(BaseRegressor):
                     if verbose:
                         print(
                             f"[mlp] early stop at epoch {epoch + 1}; "
-                            f"best val_macro_auroc={best_auroc:.4f} @ epoch {best_epoch}",
+                            f"best val_macro_{self.es_metric}={best_auroc:.4f} "
+                            f"@ epoch {best_epoch}",
                             flush=True,
                         )
                     break
@@ -972,7 +1121,7 @@ class MLPModel(BaseRegressor):
             if verbose:
                 print(
                     f"[mlp] restored best weights "
-                    f"(val_macro_auroc={best_auroc:.4f} @ epoch {best_epoch})"
+                    f"(val_macro_{self.es_metric}={best_auroc:.4f} @ epoch {best_epoch})"
                 )
         return self
     def predict(self, X: Any) -> np.ndarray:
@@ -1007,11 +1156,13 @@ class MLPModel(BaseRegressor):
             "epochs": self.epochs,
             "learning_rate": self.learning_rate,
             "weight_decay": self.weight_decay,
+            "es_metric": self.es_metric,
             "class_weights": self.class_weights,
             "target_balance": self.target_balance,
             "target_balance_ratio": self.target_balance_ratio,
             "target_bce_reduction": self.target_bce_reduction,
             "rank_loss_weight": self.rank_loss_weight,
+            "listwise_loss_weight": self.listwise_loss_weight,
             "rank_targets_per_batch": self.rank_targets_per_batch,
             "rank_samples_per_class": self.rank_samples_per_class,
             "target_size_exponent": self.target_size_exponent,
@@ -1020,6 +1171,7 @@ class MLPModel(BaseRegressor):
             "use_batchnorm": self.use_batchnorm,
             "use_bilinear": self.use_bilinear,
             "bilinear_dim": self.bilinear_dim,
+            "use_film": self.use_film,
             "protein_dim": self.protein_dim,
             "ligand_dim": self.ligand_dim,
             "seed": self.seed,
@@ -1076,6 +1228,7 @@ def load_model(path: str) -> BaseRegressor:
         use_batchnorm = bool(state.get("use_batchnorm", False))
         use_bilinear = bool(state.get("use_bilinear", False))
         bilinear_dim = int(state.get("bilinear_dim", config.MLP_DEFAULTS["bilinear_dim"]))
+        use_film = bool(state.get("use_film", config.MLP_DEFAULTS["use_film"]))
         protein_dim = int(state.get("protein_dim", config.PROTEIN_EMB_DIM))
         ligand_dim = int(state.get("ligand_dim", config.LIGAND_EMB_DIM))
         class_weights = bool(
@@ -1104,6 +1257,15 @@ def load_model(path: str) -> BaseRegressor:
         rank_loss_weight = float(
             state.get("rank_loss_weight", config.MLP_DEFAULTS["rank_loss_weight"])
         )
+        listwise_loss_weight = float(
+            state.get(
+                "listwise_loss_weight",
+                config.MLP_DEFAULTS["listwise_loss_weight"],
+            )
+        )
+        es_metric = str(
+            state.get("es_metric", config.MLP_DEFAULTS["es_metric"])
+        )
         rank_targets_per_batch = int(
             state.get(
                 "rank_targets_per_batch",
@@ -1130,17 +1292,20 @@ def load_model(path: str) -> BaseRegressor:
             epochs=state["epochs"],
             learning_rate=state["learning_rate"],
             weight_decay=state["weight_decay"],
+            es_metric=es_metric,
             class_weights=class_weights,
             target_balance=target_balance,
             target_balance_ratio=target_balance_ratio,
             target_bce_reduction=target_bce_reduction,
             rank_loss_weight=rank_loss_weight,
+            listwise_loss_weight=listwise_loss_weight,
             rank_targets_per_batch=rank_targets_per_batch,
             rank_samples_per_class=rank_samples_per_class,
             target_size_exponent=target_size_exponent,
             use_batchnorm=use_batchnorm,
             use_bilinear=use_bilinear,
             bilinear_dim=bilinear_dim,
+            use_film=use_film,
             protein_dim=protein_dim,
             ligand_dim=ligand_dim,
             seed=state["seed"],
@@ -1160,6 +1325,7 @@ def load_model(path: str) -> BaseRegressor:
             use_batchnorm=use_batchnorm,
             use_bilinear=use_bilinear,
             bilinear_dim=bilinear_dim,
+            use_film=use_film,
         )
         model.net.load_state_dict(state["state_dict"])
         model.net.to(model.device)

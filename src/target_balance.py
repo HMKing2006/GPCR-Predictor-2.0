@@ -65,10 +65,18 @@ def resolve_target_active_fraction(
                     f"Dataset active fraction must be in (0, 1); got {pi:.6f}."
                 )
             return "dataset", pi
-        raise ValueError(
-            f"Unknown target_balance_ratio {ratio!r}; "
-            f"expected one of {TARGET_BALANCE_RATIOS} or a float in (0, 1)."
-        )
+        try:
+            pi = float(key)
+        except ValueError as exc:
+            raise ValueError(
+                f"Unknown target_balance_ratio {ratio!r}; "
+                f"expected one of {TARGET_BALANCE_RATIOS} or a float in (0, 1)."
+            ) from exc
+        if not (0.0 < pi < 1.0):
+            raise ValueError(
+                f"target_balance_ratio float must be in (0, 1); got {pi!r}."
+            )
+        return "custom", pi
     pi = float(ratio)
     if not (0.0 < pi < 1.0):
         raise ValueError(

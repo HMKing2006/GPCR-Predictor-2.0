@@ -99,6 +99,59 @@ def test_rank_loss_perfect_vs_inverted() -> None:
     assert bad > good + 1.0
 
 
+def test_listwise_loss_perfect_vs_inverted() -> None:
+    """Listwise CE is lower for perfect order than inverted order."""
+    from src.rank_batches import within_target_listwise_loss
+
+    perfect = torch.tensor(
+        [5.0, 4.0, -1.0, -2.0, 3.0, 2.0, -3.0, -4.0],
+        dtype=torch.float32,
+    )
+    inverted = torch.tensor(
+        [-5.0, -4.0, 1.0, 2.0, -3.0, -2.0, 3.0, 4.0],
+        dtype=torch.float32,
+    )
+    good = float(within_target_listwise_loss(perfect, 2, 2))
+    bad = float(within_target_listwise_loss(inverted, 2, 2))
+    assert good < bad
+
+
+def test_mlp_fit_film_and_listwise_smoke() -> None:
+    """FiLM architecture with listwise loss completes one epoch."""
+    rng = np.random.default_rng(2)
+    n = 48
+    d = 8
+    X = rng.normal(size=(n, d)).astype(np.float32)
+    groups = np.repeat(np.arange(3), n // 3).astype(np.int64)
+    y = np.zeros(n, dtype=np.float32)
+    for t in range(3):
+        mask = groups == t
+        y[mask] = np.tile([1.0, 0.0], int(mask.sum()) // 2)
+    model = MLPModel(
+        hidden_dim=8,
+        num_layers=2,
+        dropout=0.0,
+        epochs=1,
+        patience=0,
+        class_weights=False,
+        target_balance="weights",
+        target_bce_reduction="mean",
+        rank_loss_weight=0.5,
+        listwise_loss_weight=0.5,
+        rank_targets_per_batch=2,
+        rank_samples_per_class=2,
+        use_film=True,
+        protein_dim=4,
+        ligand_dim=4,
+        seed=2,
+        device=torch.device("cpu"),
+    )
+    model.fit(X, y, verbose=False, groups=groups)
+    probs = model.predict(X[:4])
+    assert probs.shape == (4,)
+    assert np.all(np.isfinite(probs))
+
+
 def test_mlp_fit_mean_reduction_smoke() -> None:
     """MLP with mean-target BCE completes one epoch on tiny data."""
     rng = np.random.default_rng(0)

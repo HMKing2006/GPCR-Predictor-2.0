@@ -177,6 +177,10 @@ RF_DEFAULTS: Final[dict[str, int]] = {
 # ``use_bilinear`` adds a learned protein/ligand bilinear interaction block: the
 # protein and ligand embeddings are projected to ``bilinear_dim`` and combined by
 # ``nn.Bilinear`` before being concatenated back into the MLP trunk.
+# ``use_film`` replaces the concat MLP with a FiLM scorer: a ligand trunk is
+# modulated by scale/shift from the protein embedding (cold-protein transfer).
+# Mutually exclusive with ``use_bilinear``. ``listwise_loss_weight`` adds ListNet
+# CE on stratified target lists (requires ``target_bce_reduction=mean``).
 MLP_DEFAULTS: Final[dict[str, Any]] = {
     "hidden_dim": 512,
     "num_layers": 2,
@@ -188,17 +192,22 @@ MLP_DEFAULTS: Final[dict[str, Any]] = {
     "patience": 4,
     "es_val_fraction": 0.05,
     "es_min_delta": 1e-4,
+    # Early-stop selection metric on the cold holdout (macro per-target unless
+    # no two-class target is evaluable, in which case pooled AUROC is used).
+    "es_metric": "auroc",
     "class_weights": False,
     "target_balance": "none",
     "target_balance_ratio": "equal",
     "target_bce_reduction": "pooled",
     "rank_loss_weight": 0.0,
+    "listwise_loss_weight": 0.0,
     "rank_targets_per_batch": 32,
     "rank_samples_per_class": 8,
     "target_size_exponent": 0.0,
     "use_batchnorm": False,
     "use_bilinear": False,
     "bilinear_dim": 256,
+    "use_film": False,
 }
 
 # --- Embedding runtime -------------------------------------------------------

@@ -274,8 +274,8 @@ per-row orphan id so they never merge incorrectly.
 
 ## Splits
 
-Outer train/val/test folds are controlled by two flags (both default to
-`protein` = cold-protein):
+Outer train/val/test folds are controlled by two flags (defaults: `time`
+test, `protein` = cold-protein validation):
 
 
 | Strategy      | Meaning                                                                                    |
@@ -291,7 +291,7 @@ validation fold is used, `--validation-split` carves val from the remainder.
 keeps val for model selection.
 
 ```bash
-# Default: cold-protein test and val
+# Default: time test + cold-protein validation
 python grid_search.py --data data/train/Papyrus_full_prepared.parquet
 
 # Temporal test + cold-protein validation (select for protein transfer)
@@ -379,17 +379,21 @@ averaging regardless of the training loss flags below.
 the fit rows after the ES holdout is carved (validation/test stay unbalanced).
 `--target-balance-ratio` sets the shared active-fraction goal:
 
-| Ratio | Goal |
-| ----- | ---- |
-| `equal` | 50:50 within each target (default) |
+
+| Ratio     | Goal                                         |
+| --------- | -------------------------------------------- |
+| `equal`   | 50:50 within each target (default)           |
 | `dataset` | Fit-set mean prevalence π within each target |
 
-| Mode | Behavior |
-| ---- | -------- |
-| `none` | No per-target balancing (default) |
-| `weights` | Per-target positive weight so weighted active mass fraction = goal; drop monomorphic targets |
-| `downsample` | Resample majority class toward the goal rate; drop monomorphic targets |
-| `upsample` | Duplicate scarce class toward the goal rate; drop monomorphic targets |
+
+
+| Mode         | Behavior                                                                                     |
+| ------------ | -------------------------------------------------------------------------------------------- |
+| `none`       | No per-target balancing (default)                                                            |
+| `weights`    | Per-target positive weight so weighted active mass fraction = goal; drop monomorphic targets |
+| `downsample` | Resample majority class toward the goal rate; drop monomorphic targets                       |
+| `upsample`   | Duplicate scarce class toward the goal rate; drop monomorphic targets                        |
+
 
 Balancing prints ratio/π, kept/excluded target counts (`all_active` /
 `all_inactive`), and row counts before/after. It cannot be combined with
@@ -397,10 +401,12 @@ Balancing prints ratio/π, kept/excluded target counts (`all_active` /
 
 `--target-bce-reduction` chooses how BCE is aggregated during MLP training:
 
-| Reduction | Behavior |
-| --------- | -------- |
-| `pooled` | Default. Random mixed-target minibatches; global BCE (current behavior). |
-| `mean` | Stratified batches of `T` proteins × `k` actives + `k` inactives each; loss is the average of per-target BCEs so every protein contributes equally. |
+
+| Reduction | Behavior                                                                                                                                            |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pooled`  | Default. Random mixed-target minibatches; global BCE (current behavior).                                                                            |
+| `mean`    | Stratified batches of `T` proteins × `k` actives + `k` inactives each; loss is the average of per-target BCEs so every protein contributes equally. |
+
 
 Stratified batch size is `T × 2 × k`, controlled by `--rank-targets-per-batch`
 (`T`, default 32) and `--rank-samples-per-class` (`k`, default 8). In `mean`
@@ -424,7 +430,7 @@ on the fit rows. Default is off (`--no-class-weights`).
 ## Grid search
 
 ```bash
-# BindingDB (default: cold-protein test + val)
+# BindingDB (default: time test + cold-protein val)
 python grid_search.py
 
 # Papyrus++
@@ -451,8 +457,8 @@ python grid_search.py --no-class-weights
 ```
 
 Iterates over MLP hyperparameter combinations (and optionally RF baselines)
-using nested `--test-split` / `--validation-split` folds (both default to
-cold-protein), prints each candidate's validation **macro per-target AUROC**
+using nested `--test-split` / `--validation-split` folds (defaults: time test,
+cold-protein val), prints each candidate's validation **macro per-target AUROC**
 as it finishes (pooled AUROC as fallback), evaluates the best model on test
 with novelty and macro known/unknown breakouts, and saves to `models/`.
 MLP candidates inherit early stopping, `class_weights`, `target_balance`,
