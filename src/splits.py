@@ -4,6 +4,8 @@ A *double-cold* split guarantees that train/val/test share neither proteins nor
 Murcko scaffolds: rows are partitioned by connected components of the
 protein–scaffold co-occurrence graph. A *cold protein* (``protein``) split only
 enforces protein disjointness. A *time* split partitions by publication year.
+A *time-protein* split takes the latest calendar year(s) of proteins that do
+not appear in earlier years (undated rows count as train / seen).
 
 Outer folds can use independent strategies: ``test`` is carved first, then
 ``val`` is carved from the remainder (when a validation fold is requested).
@@ -23,7 +25,12 @@ import numpy as np
 import config
 
 # Supported outer-fold strategies for ``--test-split`` / ``--validation-split``.
-SPLIT_STRATEGIES: tuple[str, ...] = ("protein", "double-cold", "time")
+SPLIT_STRATEGIES: tuple[str, ...] = (
+    "protein",
+    "double-cold",
+    "time",
+    "time-protein",
+)
 
 
 def _assign_blocks_to_splits(
@@ -572,6 +579,87 @@ def time_split(
     }
 
 
+def time_protein_split(
+    years: np.ndarray,
+    protein_groups: np.ndarray,
+    *,
+    n_years: int = 1,
+    min_val_rows: int = 1,
+) -> dict[str, np.ndarray]:
+    """Hold out new proteins from the latest ``n_years`` of dated rows.
+
+    Proteins that appear in earlier years or on undated rows are treated as
+    seen and stay in train, even if they also have rows in the holdout
+    window. If the cold subset is smaller than ``min_val_rows``, the window
+    expands one year at a time.
+
+    Args:
+        years: Per-row years; missing values should be ``-1``.
+        protein_groups: Per-row protein group ids aligned with ``years``.
+        n_years: Starting holdout window in calendar years (at least 1).
+        min_val_rows: Expand the window until the cold holdout has at least
+            this many rows (or years run out).
+
+    Returns:
+        Mapping with ``train`` and ``val`` as sorted ``int64`` index arrays.
+
+    Raises:
+        ValueError: If there are no dated rows or array lengths differ.
+    """
+    years = np.asarray(years)
+    protein_groups = np.asarray(protein_groups)
+    if years.shape[0] != protein_groups.shape[0]:
+        raise ValueError(
+            f"years length {years.shape[0]} does not match "
+            f"protein_groups length {protein_groups.shape[0]}."
+        )
+    dated = years[years >= 0]
+    if dated.size == 0:
+        raise ValueError(
+            "No dated rows available for a time-protein split. Rebuild "
+            "features from a Papyrus Parquet file that includes Year."
+        )
+    unique_years = np.unique(dated).astype(np.int64)
+    window = max(1, int(n_years))
+    min_val_rows = max(1, int(min_val_rows))
+    n = int(years.shape[0])
+    best_val = np.empty(0, dtype=np.int64)
+    for width in range(window, int(unique_years.size) + 1):
+        cutoff = int(unique_years[-width])
+        in_window = years >= cutoff
+        earlier = years < cutoff
+        if not np.any(earlier):
+            train_prots = np.empty(0, dtype=protein_groups.dtype)
+        else:
+            train_prots = np.unique(protein_groups[earlier])
+        cold = in_window & ~np.isin(protein_groups, train_prots)
+        val_idx = np.flatnonzero(cold).astype(np.int64)
+        if val_idx.shape[0] >= best_val.shape[0]:
+            best_val = val_idx
+        if val_idx.shape[0] >= min_val_rows:
+            best_val = val_idx
+            break
+    val_mask = np.zeros(n, dtype=bool)
+    if best_val.size:
+        val_mask[best_val] = True
+    return {
+        "train": np.flatnonzero(~val_mask).astype(np.int64),
+        "val": np.flatnonzero(val_mask).astype(np.int64),
+    }
+
+
+def _uses_years(strategy: str) -> bool:
+    """Return True when ``strategy`` needs publication years.
+
+    Args:
+        strategy: A split strategy token.
+
+    Returns:
+        ``True`` for ``time`` and ``time-protein``.
+    """
+    return strategy in ("time", "time-protein")
+
+
 def get_or_create_time_split(
     years: np.ndarray,
     signature: str,
@@ -666,7 +754,8 @@ def _partition_pool(
         fractions: Mapping from fold name to target fraction within ``pool``.
         protein_groups: Full-dataset protein group ids.
         scaffold_groups: Full-dataset scaffold ids (required for double-cold).
-        years: Full-dataset years (required for time); ``-1`` when missing.
+        years: Full-dataset years (required for time / time-protein); ``-1``
+            when missing.
         seed: Random seed for block assignment strategies.
 
     Returns:
@@ -681,6 +770,7 @@ def _partition_pool(
 
     protein_groups = np.asarray(protein_groups)
     strategy = _validate_strategy("strategy", strategy)
+    n_tp_years = int(getattr(config, "TIME_PROTEIN_YEARS", 1))
 
     if strategy == "protein":
         local = cold_protein_split(protein_groups[pool], fractions, seed=seed)
@@ -693,6 +783,47 @@ def _partition_pool(
             fractions,
             seed=seed,
         )
+    elif strategy == "time-protein":
+        if years is None:
+            raise ValueError("time-protein splits require years.")
+        years_arr = np.asarray(years)
+        names = set(fractions)
+        years_local = years_arr[pool]
+        groups_local = protein_groups[pool]
+        if names == {"train", "test"}:
+            two_way = time_protein_split(
+                years_local, groups_local, n_years=n_tp_years
+            )
+            local = {"train": two_way["train"], "test": two_way["val"]}
+        elif names == {"train", "val"}:
+            local = time_protein_split(
+                years_local, groups_local, n_years=n_tp_years
+            )
+        elif names == {"train", "val", "test"}:
+            first = time_protein_split(
+                years_local, groups_local, n_years=n_tp_years
+            )
+            rest = first["train"]
+            test_local = first["val"]
+            if rest.size == 0:
+                local = {
+                    "train": rest,
+                    "val": np.empty(0, dtype=np.int64),
+                    "test": test_local,
+                }
+            else:
+                second = time_protein_split(
+                    years_local[rest], groups_local[rest], n_years=n_tp_years
+                )
+                local = {
+                    "train": rest[second["train"]],
+                    "val": rest[second["val"]],
+                    "test": test_local,
+                }
+        else:
+            raise ValueError(
+                f"Unsupported time-protein fraction keys: {sorted(fractions)}"
+            )
     else:  # time
         if years is None:
             raise ValueError("time splits require years.")
@@ -753,7 +884,7 @@ def _build_nested_split(
             ``include_val`` is ``False``).
         protein_groups: Per-row protein group ids.
         scaffold_groups: Per-row scaffold ids (for double-cold).
-        years: Per-row years (for time); ``-1`` when missing.
+        years: Per-row years (for time / time-protein); ``-1`` when missing.
         val_fraction: Target fraction of *all* rows for validation.
         test_fraction: Target fraction of *all* rows for test.
         include_val: If ``False``, return only train/test (remainder → train).
@@ -883,7 +1014,7 @@ def get_or_create_nested_split(
         protein_groups: Per-row protein group ids.
         signature: Dataset signature for cache binding.
         test_split: Strategy for the test fold (``protein``, ``double-cold``,
-            or ``time``).
+            ``time``, or ``time-protein``).
         validation_split: Strategy for the validation fold. Ignored when
             ``include_val`` is ``False`` (remainder after test → train). When
             equal to ``test_split``, a single joint partition is used.
@@ -891,7 +1022,8 @@ def get_or_create_nested_split(
         test_fraction: Target fraction of all rows for test.
         include_val: If ``False``, return train/test only.
         scaffold_groups: Required when either strategy is ``double-cold``.
-        years: Required when either strategy is ``time``; ``-1`` if missing.
+        years: Required when either strategy is ``time`` or ``time-protein``;
+            ``-1`` if missing.
         seed: Random seed for cold / double-cold assignment.
         splits_dir: Directory for split cache files.
         verbose: If ``True``, print reuse/create messages.
@@ -905,8 +1037,8 @@ def get_or_create_nested_split(
     """
     test_split = _validate_strategy("test_split", test_split)
     validation_split = _validate_strategy("validation_split", validation_split)
-    needs_time = test_split == "time" or (
-        include_val and validation_split == "time"
+    needs_time = _uses_years(test_split) or (
+        include_val and _uses_years(validation_split)
     )
     needs_dc = test_split == "double-cold" or (
         include_val and validation_split == "double-cold"
@@ -931,10 +1063,15 @@ def get_or_create_nested_split(
     protein_groups = np.asarray(protein_groups)
     n = int(protein_groups.shape[0])
     effective_val = validation_split if include_val else test_split
+    tp_years = int(getattr(config, "TIME_PROTEIN_YEARS", 1))
+    uses_tp = test_split == "time-protein" or (
+        include_val and validation_split == "time-protein"
+    )
     split_type = (
         f"nested__test-{test_split}__val-{effective_val}"
         f"__val{100.0 * val_fraction:g}pct"
         f"__test{100.0 * test_fraction:g}pct"
+        + (f"__tpyears{tp_years}" if uses_tp else "")
         + ("" if include_val else "__val-merged")
     )
 

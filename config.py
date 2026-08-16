@@ -137,10 +137,13 @@ GRID_TEST_FRACTION: Final[float] = 0.10
 
 # Outer fold strategies for ``--test-split`` / ``--validation-split``.
 # ``protein`` = cold-protein; ``double-cold`` = protein+scaffold; ``time`` =
-# publication-year. When the two flags differ, test is carved first and val is
+# publication-year; ``time-protein`` = latest ~N years of proteins unseen in
+# earlier years. When the two flags differ, test is carved first and val is
 # carved from the remainder.
 DEFAULT_TEST_SPLIT: Final[str] = "time"
-DEFAULT_VALIDATION_SPLIT: Final[str] = "protein"
+DEFAULT_VALIDATION_SPLIT: Final[str] = "time-protein"
+# Starting year-window for ``time-protein`` (expands if the cold subset is empty).
+TIME_PROTEIN_YEARS: Final[int] = 1
 
 # Random-forest defaults (warm-start incremental training).
 RF_DEFAULTS: Final[dict[str, int]] = {
@@ -154,12 +157,13 @@ RF_DEFAULTS: Final[dict[str, int]] = {
 
 # Torch MLP defaults.
 #
-# ``patience`` and ``es_val_fraction`` drive early stopping: a double-cold
-# holdout targeting ``es_val_fraction`` of the training rows is carved each
-# fit (no protein or scaffold overlap with the fit set), validation AUROC is
-# tracked after every epoch, the best weights are restored, and training stops
-# once AUROC fails to improve for ``patience`` consecutive epochs. Set
-# ``patience`` to ``0`` to disable early stopping and always run ``epochs``.
+# ``patience`` and ``es_val_fraction`` drive early stopping: a time-protein
+# holdout (latest ~1 year of proteins unseen in earlier years) is preferred.
+# If years are missing or that holdout is below ~0.25 * es_val_fraction of
+# fit rows, fall back to double-cold then cold-protein. Validation score is
+# tracked after every epoch, the best weights are restored, and training
+# stops once the score fails to improve for ``patience`` consecutive epochs.
+# Set ``patience`` to ``0`` to disable early stopping and always run ``epochs``.
 # ``class_weights`` sets BCE ``pos_weight`` to ``n_neg / n_pos`` on the fit
 # rows (inverse class frequency) to counter sparse actives; disable for plain BCE.
 # Default is off to match the screening GUI checkpoint.

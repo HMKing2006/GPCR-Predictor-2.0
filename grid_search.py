@@ -4,8 +4,9 @@ Each candidate is trained on the train split and scored on the validation split,
 with metrics printed as soon as the candidate finishes. The candidate with the
 highest validation macro per-target AUROC is finally evaluated on the held-out
 test split (with protein/scaffold novelty breakouts) and saved. Use
-``--test-split`` / ``--validation-split`` (defaults: time test, cold-protein
-val); e.g. ``--test-split time --validation-split protein``.
+``--test-split`` / ``--validation-split`` (defaults: time test, time-protein
+val); e.g. ``--test-split time --validation-split protein`` to select for
+protein transfer only.
 """
 
 from __future__ import annotations
@@ -229,7 +230,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=config.DEFAULT_TEST_SPLIT,
         help=(
             "Strategy for the held-out test fold (default: time): cold-protein, "
-            "double-cold protein+scaffold, or publication-year time."
+            "double-cold protein+scaffold, publication-year time, or "
+            "time-protein (latest year of unseen proteins)."
         ),
     )
     p.add_argument(
@@ -237,7 +239,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=list(SPLIT_STRATEGIES),
         default=config.DEFAULT_VALIDATION_SPLIT,
         help=(
-            "Strategy for the validation fold (default: protein). Test is "
+            "Strategy for the validation fold (default: time-protein). Test is "
             "carved first; val is carved from the remainder."
         ),
     )

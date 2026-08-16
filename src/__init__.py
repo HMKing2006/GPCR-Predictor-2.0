@@ -7,7 +7,7 @@ Modules:
     ligand_repr: Morgan/Avalon fingerprints, RDKit descriptors, and composite
         ligand representations.
     featurize: Build compact snapshots and gather feature batches on demand.
-    splits: Double-cold and temporal splitting with validated reuse.
+    splits: Double-cold, temporal, and time-protein splitting with validated reuse.
     models: Random-forest and MLP classifiers with a shared interface.
     metrics: Classification metric helpers.
     io_utils: Readers/writers for spreadsheet, SMILES, SDF and FASTA formats.

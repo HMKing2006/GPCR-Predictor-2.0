@@ -39,7 +39,7 @@ from src.rank_batches import (
     within_target_listwise_loss,
     within_target_rank_loss,
 )
-from src.splits import cold_protein_split, double_cold_split
+from src.splits import cold_protein_split, double_cold_split, time_protein_split
 from src.target_balance import (
     TARGET_BALANCE_MODES,
     TARGET_BALANCE_RATIOS,
@@ -426,9 +426,10 @@ class MLPModel(BaseRegressor):
             weight_decay: Adam weight decay.
             patience: Epochs without validation-AUROC improvement tolerated before
                 stopping early. ``0`` disables early stopping.
-            es_val_fraction: Target fraction of training *rows* held out as a
-                cold-protein early-stopping set (proteins disjoint from the
-                fit set; double-cold when scaffolds are provided).
+            es_val_fraction: Target fraction of training *rows* used as a
+                minimum-size bar for the early-stopping holdout. The preferred
+                carve is time-protein (latest year of unseen proteins);
+                double-cold / cold-protein are fallbacks.
             es_min_delta: Minimum validation-score increase counted as an
                 improvement.
             es_metric: Macro per-target early-stop score: one of ``auroc``,
@@ -697,14 +698,17 @@ class MLPModel(BaseRegressor):
         verbose: bool = True,
         groups: Optional[np.ndarray] = None,
         scaffold_groups: Optional[np.ndarray] = None,
+        years: Optional[np.ndarray] = None,
     ) -> "MLPModel":
         """Train the MLP with minibatch Adam and validation early stopping.
 
-        When ``patience > 0``, a holdout of about ``es_val_fraction`` of the
-        rows is carved so no protein (and, when ``scaffold_groups`` is provided,
-        no Murcko scaffold) appears in both the fit set and the early-stopping
-        set. After each epoch the holdout macro per-target AUROC is measured;
-        the best-performing weights are cached and restored at the end, and
+        When ``patience > 0``, a holdout is carved for early stopping. The
+        preferred carve is **time-protein**: latest calendar year(s) of
+        proteins that do not appear in earlier years. If years are missing or
+        that holdout is too small, a double-cold holdout is used when
+        ``scaffold_groups`` is provided, otherwise cold-protein. After each
+        epoch the holdout macro per-target score is measured; the
+        best-performing weights are cached and restored at the end, and
         training stops early once that score fails to improve by
         ``es_min_delta`` for ``patience`` consecutive epochs. Early stopping is
         skipped when ``patience`` is ``0``.
@@ -728,8 +732,9 @@ class MLPModel(BaseRegressor):
                 ``target_balance != 'none'``, ``target_bce_reduction='mean'``,
                 or ``target_size_exponent > 0``.
             scaffold_groups: Optional per-row Murcko scaffold ids aligned with
-                ``X`` / ``y``. When provided with ``groups``, the early-stopping
-                holdout is double-cold (protein and scaffold disjoint).
+                ``X`` / ``y``. Used for the double-cold ES fallback.
+            years: Optional per-row publication years (``-1`` when missing).
+                When provided, preferred for the time-protein ES holdout.
 
         Returns:
             ``self``.
@@ -797,32 +802,68 @@ class MLPModel(BaseRegressor):
                 n_val = int(split["es_val"].shape[0])
                 return n_train > 0 and n_val >= min_es_rows and n_train >= n_val
 
-            if scaffold_groups is not None:
-                scaffold_arr = np.asarray(scaffold_groups)
-                if scaffold_arr.shape[0] != n:
+            es_split: Optional[dict[str, np.ndarray]] = None
+            es_kind = "time-protein"
+            if years is not None:
+                years_arr = np.asarray(years)
+                if years_arr.shape[0] != n:
                     raise ValueError(
-                        f"scaffold_groups length {scaffold_arr.shape[0]} "
-                        f"does not match X rows {n}."
+                        f"years length {years_arr.shape[0]} does not match X rows {n}."
                     )
-                es_split = double_cold_split(
-                    groups_arr, scaffold_arr, fractions, seed=self.seed
-                )
-                if _usable(es_split):
-                    es_kind = "double-cold"
-                else:
-                    if verbose:
-                        print(
-                            "[mlp] double-cold ES holdout too small; "
-                            "falling back to cold-protein",
-                            flush=True,
+                if int(np.sum(years_arr >= 0)) > 0:
+                    try:
+                        two_way = time_protein_split(
+                            years_arr,
+                            groups_arr,
+                            n_years=int(config.TIME_PROTEIN_YEARS),
+                            min_val_rows=min_es_rows,
                         )
+                        candidate = {
+                            "train": two_way["train"],
+                            "es_val": two_way["val"],
+                        }
+                        if _usable(candidate):
+                            es_split = candidate
+                            es_kind = "time-protein"
+                    except ValueError:
+                        es_split = None
+
+            if es_split is None:
+                if verbose and years is not None:
+                    print(
+                        "[mlp] time-protein ES holdout too small / unavailable; "
+                        "falling back to double-cold / cold-protein",
+                        flush=True,
+                    )
+                if scaffold_groups is not None:
+                    scaffold_arr = np.asarray(scaffold_groups)
+                    if scaffold_arr.shape[0] != n:
+                        raise ValueError(
+                            f"scaffold_groups length {scaffold_arr.shape[0]} "
+                            f"does not match X rows {n}."
+                        )
+                    es_split = double_cold_split(
+                        groups_arr, scaffold_arr, fractions, seed=self.seed
+                    )
+                    if _usable(es_split):
+                        es_kind = "double-cold"
+                    else:
+                        if verbose:
+                            print(
+                                "[mlp] double-cold ES holdout too small; "
+                                "falling back to cold-protein",
+                                flush=True,
+                            )
+                        es_split = cold_protein_split(
+                            groups_arr, fractions, seed=self.seed
+                        )
+                        es_kind = "cold-protein"
+                else:
                     es_split = cold_protein_split(
                         groups_arr, fractions, seed=self.seed
                     )
                     es_kind = "cold-protein"
-            else:
-                es_split = cold_protein_split(groups_arr, fractions, seed=self.seed)
-                es_kind = "cold-protein"
+
             train_rows = es_split["train"]
             val_rows = es_split["es_val"]
             early_stopping = _usable(es_split)

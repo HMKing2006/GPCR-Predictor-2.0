@@ -1,7 +1,7 @@
 """Train a single binder / non-binder classifier.
 
 Builds (or reuses) a compact feature snapshot, applies nested outer folds via
-``--test-split`` / ``--validation-split`` (defaults: time test, cold-protein
+``--test-split`` / ``--validation-split`` (defaults: time test, time-protein
 val), trains the requested model, prints classification metrics and novelty
 breakouts on the held-out test set, and saves the model as a joblib file. The
 core routines are imported by ``grid_search.py``.
@@ -140,9 +140,10 @@ def fit_on_indices(
         )
     fit_kwargs: dict[str, Any] = {"verbose": verbose}
     if model_type == "mlp":
-        # Align protein/scaffold ids with the selected FeatureView for ES.
+        # Align protein/scaffold/year ids with the selected FeatureView for ES.
         fit_kwargs["groups"] = dataset.load_groups()[train_idx]
         fit_kwargs["scaffold_groups"] = dataset.load_scaffold_groups()[train_idx]
+        fit_kwargs["years"] = dataset.load_years()[train_idx]
     model.fit(X_train, y_train, **fit_kwargs)
     if model_type == "mlp" and getattr(model, "balance_summary", None) is not None:
         model.metadata["balance_summary"] = model.balance_summary
@@ -246,8 +247,8 @@ def _resolve_split(
     needs_dc = test_split == "double-cold" or (
         include_val and validation_split == "double-cold"
     )
-    needs_time = test_split == "time" or (
-        include_val and validation_split == "time"
+    needs_time = test_split in ("time", "time-protein") or (
+        include_val and validation_split in ("time", "time-protein")
     )
     scaffold_groups = dataset.load_scaffold_groups() if needs_dc else None
     years = None
@@ -511,8 +512,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=config.GRID_VAL_FRACTION,
         help=(
             "Validation fraction of all rows (grid search). For time validation "
-            "this sizes the year window; in train.py the val fold is merged "
-            "into train unless grid search is used."
+            "this sizes the year window; time-protein uses a ~1-year cold "
+            "window instead. In train.py the val fold is merged into train "
+            "unless grid search is used."
         ),
     )
     p.add_argument(
@@ -521,7 +523,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=config.DEFAULT_TEST_SPLIT,
         help=(
             "Strategy for the held-out test fold (default: time): cold-protein, "
-            "double-cold protein+scaffold, or publication-year time."
+            "double-cold protein+scaffold, publication-year time, or "
+            "time-protein (latest year of unseen proteins)."
         ),
     )
     p.add_argument(
@@ -529,7 +532,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=list(SPLIT_STRATEGIES),
         default=config.DEFAULT_VALIDATION_SPLIT,
         help=(
-            "Strategy for the validation fold (default: protein). Test is "
+            "Strategy for the validation fold (default: time-protein). Test is "
             "carved first; val is carved from the remainder when a val fold is "
             "used. Example: --test-split time --validation-split protein."
         ),
@@ -594,7 +597,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--es-val-fraction",
         type=float,
         default=float(config.MLP_DEFAULTS["es_val_fraction"]),
-        help="Target fraction of training rows for the double-cold MLP ES holdout.",
+        help="Minimum-size bar for the MLP ES holdout (~0.25 of this fraction of train rows).",
     )
     p.add_argument(
         "--es-metric",

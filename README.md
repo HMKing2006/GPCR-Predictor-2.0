@@ -6,7 +6,7 @@ descriptors (MoLFormer-XL and other reps are available via `--ligand-model`).
 Proteins are embedded with ESM-2. Ligand and protein vectors are cached
 in LMDB stores named after the components that produced them. Outer folds use
 independent `--test-split` / `--validation-split` strategies (defaults:
-**time** test, **cold-protein** validation); test is carved first, then
+**time** test, **time-protein** validation); test is carved first, then
 validation from the remainder.
 Evaluation reports AUROC/AUPRC plus known/unknown protein and scaffold breakouts.
 By default the feature vector is protein + ligand only (assay type, pH, and
@@ -275,14 +275,15 @@ per-row orphan id so they never merge incorrectly.
 ## Splits
 
 Outer train/val/test folds are controlled by two flags (defaults: `time`
-test, `protein` = cold-protein validation):
+test, `time-protein` validation):
 
 
-| Strategy      | Meaning                                                                                    |
-| ------------- | ------------------------------------------------------------------------------------------ |
-| `protein`     | Train/val/test share no proteins                                                           |
-| `double-cold` | Share neither proteins nor Murcko scaffolds                                                |
-| `time`        | Publication-year cutoffs from `--val-fraction` / `--test-fraction` (missing years → train) |
+| Strategy       | Meaning                                                                                         |
+| -------------- | ----------------------------------------------------------------------------------------------- |
+| `protein`      | Train/val/test share no proteins                                                                |
+| `double-cold`  | Share neither proteins nor Murcko scaffolds                                                     |
+| `time`         | Publication-year cutoffs from `--val-fraction` / `--test-fraction` (missing years → train)      |
+| `time-protein` | Latest ~1 year of proteins unseen in earlier years (window expands if the cold subset is empty) |
 
 
 **Composition:** test is always carved with `--test-split` first; when a
@@ -291,7 +292,7 @@ validation fold is used, `--validation-split` carves val from the remainder.
 keeps val for model selection.
 
 ```bash
-# Default: time test + cold-protein validation
+# Default: time test + time-protein validation
 python grid_search.py --data data/train/Papyrus_full_prepared.parquet
 
 # Temporal test + cold-protein validation (select for protein transfer)
@@ -365,11 +366,11 @@ joblib file. Splits are saved under the matching `cache/datasets/<stem>/splits/`
 directory and reused only when their embedded row-layout signature and seed
 match.
 
-MLP early stopping carves a holdout from the **training** split (~5% of train
-rows by target). It prefers a **double-cold** holdout (no protein or scaffold
-overlap with the fit set). If that holdout is too small — common when the
-protein–scaffold graph forms a giant connected component — it falls back to a
-**cold-protein** holdout. Early stopping tracks **macro per-target AUROC** on
+MLP early stopping carves a holdout from the **training** split. It prefers a
+**time-protein** holdout (latest ~1 year of proteins unseen in earlier years,
+expanding the window if needed). If years are missing or that holdout is below
+~1.25% of fit rows (`0.25 * es_val_fraction`), it falls back to **double-cold**
+then **cold-protein**. Early stopping tracks **macro per-target AUROC** on
 that holdout (falling back to pooled AUROC only when no two-class target is
 evaluable). This inner ES carve is independent of `--test-split` /
 `--validation-split`. Reported test macro metrics use the same within-target
@@ -430,7 +431,7 @@ on the fit rows. Default is off (`--no-class-weights`).
 ## Grid search
 
 ```bash
-# BindingDB (default: time test + cold-protein val)
+# BindingDB (default: time test + time-protein val)
 python grid_search.py
 
 # Papyrus++
@@ -458,7 +459,7 @@ python grid_search.py --no-class-weights
 
 Iterates over MLP hyperparameter combinations (and optionally RF baselines)
 using nested `--test-split` / `--validation-split` folds (defaults: time test,
-cold-protein val), prints each candidate's validation **macro per-target AUROC**
+time-protein val), prints each candidate's validation **macro per-target AUROC**
 as it finishes (pooled AUROC as fallback), evaluates the best model on test
 with novelty and macro known/unknown breakouts, and saves to `models/`.
 MLP candidates inherit early stopping, `class_weights`, `target_balance`,
@@ -609,7 +610,7 @@ src/lmdb_cache.py    Embedding and Murcko scaffold LMDB caches.
 src/embeddings.py    ESM-2 and MoLFormer-XL embedders.
 src/ligand_repr.py   Fingerprints, descriptors, composite ligand reps.
 src/featurize.py     Compact feature snapshots + on-demand FeatureView.
-src/splits.py        Nested test/val strategies (protein, double-cold, time).
+src/splits.py        Nested test/val strategies (protein, double-cold, time, time-protein).
 src/models.py        Warm-start RF + torch MLP classifiers.
 src/metrics.py       Classification metrics + novelty breakouts.
 src/io_utils.py      Spreadsheet / SMILES / SDF / FASTA IO.
