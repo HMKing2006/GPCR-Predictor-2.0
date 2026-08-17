@@ -366,6 +366,35 @@ joblib file. Splits are saved under the matching `cache/datasets/<stem>/splits/`
 directory and reused only when their embedded row-layout signature and seed
 match.
 
+### Potency-range model (IC50 / EC50)
+
+`train_range.py` trains a **multi-head** pair MLP on quantitative IC50 and EC50
+rows only. Shared ESM + ligand features feed two 5-way heads that classify
+potency into:
+
+`<10 nM` | `10–100 nM` | `100 nM–1 µM` | `1–10 µM` | `≥10 µM`
+
+Ki/Kd/Other and Papyrus `Activity_class` binary rows are excluded by default.
+Feature caches live under `cache/datasets/<stem>__range/` so they do not collide
+with binder snapshots. Loss is masked cross-entropy (an IC50 row updates only
+the IC50 head). Early stopping uses mean per-head macro-F1 on a time-protein
+holdout (same carve preference as the binder MLP).
+
+```bash
+# Default: morgan+descriptors, time test / time-protein ES, class-weighted CE
+python train_range.py
+
+# Smoke test
+python train_range.py --limit 20000 --epochs 2 --output models/range_smoke.joblib
+
+# Later: map inactive binary rows into the ≥10 µM bin (both heads when source is Other)
+python train_range.py --include-binary --binary-inactive-bin 4 --rebuild-features
+```
+
+Per-head accuracy, macro-F1, ordinal MAE, and mean macro-F1 are printed on the
+held-out test fold. The checkpoint is written to
+`models/mlp_range_ic50_ec50_morgan_descriptors.joblib` by default.
+
 MLP early stopping carves a holdout from the **training** split. It prefers a
 **time-protein** holdout (latest ~1 year of proteins unseen in earlier years,
 expanding the window if needed). If years are missing or that holdout is below
